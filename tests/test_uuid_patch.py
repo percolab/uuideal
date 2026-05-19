@@ -56,12 +56,18 @@ def test_install_preserves_function_identities() -> None:
     uuid1 = uuid.uuid1
     uuid_class_init = uuid.UUID.__init__
     uuid_class_str = uuid.UUID.__str__
+    uuid6 = getattr(uuid, "uuid6", None)
+    uuid7 = getattr(uuid, "uuid7", None)
 
     uuideal.install()
     uuideal.install()
 
     assert uuid.uuid4 is uuid4
     assert uuid.uuid1 is uuid1
+    if uuid6 is not None:
+        assert uuid.uuid6 is uuid6
+    if uuid7 is not None:
+        assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
     assert uuideal.is_enabled()
@@ -71,6 +77,10 @@ def test_install_preserves_function_identities() -> None:
 
     assert uuid.uuid4 is uuid4
     assert uuid.uuid1 is uuid1
+    if uuid6 is not None:
+        assert uuid.uuid6 is uuid6
+    if uuid7 is not None:
+        assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
     assert not uuideal.is_enabled()
@@ -158,6 +168,46 @@ def test_uuid1_explicit_inputs_have_expected_static_fields() -> None:
     assert value.clock_seq == 0x1234
     assert value.is_safe == uuid.SafeUUID.unknown
 
+
+def test_uuid6_shortcut_and_patch_have_expected_static_fields() -> None:
+    shortcut_value = uuideal.uuid6(node=0x123456789ABC, clock_seq=0x1234)
+    assert type(shortcut_value) is uuid.UUID
+    assert shortcut_value.version == 6
+    assert shortcut_value.variant == uuid.RFC_4122
+    assert shortcut_value.node == 0x123456789ABC
+    assert shortcut_value.clock_seq == 0x1234
+    assert shortcut_value.is_safe == uuid.SafeUUID.unknown
+
+    if hasattr(uuid, "uuid6"):
+        uuid6_identity = uuid.uuid6
+        uuideal.install()
+        patched_value = uuid.uuid6(node=0x123456789ABC, clock_seq=0x1234)
+        assert uuid.uuid6 is uuid6_identity
+        assert type(patched_value) is uuid.UUID
+        assert patched_value.version == 6
+        assert patched_value.variant == uuid.RFC_4122
+        assert patched_value.node == 0x123456789ABC
+        assert patched_value.clock_seq == 0x1234
+
+
+def test_uuid7_shortcut_and_patch_have_expected_fields() -> None:
+    shortcut_values = [uuideal.uuid7() for _ in range(100)]
+    assert all(type(value) is uuid.UUID for value in shortcut_values)
+    assert all(value.version == 7 for value in shortcut_values)
+    assert all(value.variant == uuid.RFC_4122 for value in shortcut_values)
+    assert len({value.int for value in shortcut_values}) == len(shortcut_values)
+    assert shortcut_values == sorted(shortcut_values)
+
+    if hasattr(uuid, "uuid7"):
+        uuid7_identity = uuid.uuid7
+        uuideal.install()
+        patched_values = [uuid.uuid7() for _ in range(100)]
+        assert uuid.uuid7 is uuid7_identity
+        assert all(type(value) is uuid.UUID for value in patched_values)
+        assert all(value.version == 7 for value in patched_values)
+        assert all(value.variant == uuid.RFC_4122 for value in patched_values)
+        assert len({value.int for value in patched_values}) == len(patched_values)
+        assert patched_values == sorted(patched_values)
 
 def test_error_equivalence_for_representative_invalid_inputs() -> None:
     invalid_calls = [

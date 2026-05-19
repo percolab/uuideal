@@ -20,7 +20,9 @@ const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
 
 static PATCHED: AtomicBool = AtomicBool::new(false);
 static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-
+static LAST_TIMESTAMP_V6: AtomicU64 = AtomicU64::new(0);
+static LAST_TIMESTAMP_V7: AtomicU64 = AtomicU64::new(0);
+static LAST_COUNTER_V7: AtomicU64 = AtomicU64::new(0);
 
 static mut UUID_MODULE: *mut PyObject = ptr::null_mut();
 static mut UUID_TYPE: *mut PyObject = ptr::null_mut();
@@ -59,8 +61,17 @@ struct PyMemberDescrObjectLayout {
 extern "C" {
     fn PyFunction_SetVectorcall(callable: *mut PyObject, vectorcall: vectorcallfunc);
     fn PyVectorcall_Function(callable: *mut PyObject) -> Option<vectorcallfunc>;
-    fn PyLong_FromUnsignedNativeBytes(buffer: *const c_void, n_bytes: usize, flags: c_int) -> *mut PyObject;
-    fn PyLong_AsNativeBytes(value: *mut PyObject, buffer: *mut c_void, n_bytes: Py_ssize_t, flags: c_int) -> Py_ssize_t;
+    fn PyLong_FromUnsignedNativeBytes(
+        buffer: *const c_void,
+        n_bytes: usize,
+        flags: c_int,
+    ) -> *mut PyObject;
+    fn PyLong_AsNativeBytes(
+        value: *mut PyObject,
+        buffer: *mut c_void,
+        n_bytes: Py_ssize_t,
+        flags: c_int,
+    ) -> Py_ssize_t;
 }
 
 unsafe fn incref(object: *mut PyObject) -> *mut PyObject {
@@ -78,7 +89,6 @@ unsafe fn xdecref(object: *mut PyObject) {
     }
 }
 
-
 unsafe fn none() -> *mut PyObject {
     unsafe { incref(Py_None()) }
 }
@@ -91,7 +101,11 @@ unsafe fn attribute(object: *mut PyObject, name: *const c_char) -> *mut PyObject
     unsafe { PyObject_GetAttrString(object, name) }
 }
 
-unsafe fn generic_set_attribute(object: *mut PyObject, name: *const c_char, value: *mut PyObject) -> c_int {
+unsafe fn generic_set_attribute(
+    object: *mut PyObject,
+    name: *const c_char,
+    value: *mut PyObject,
+) -> c_int {
     unsafe {
         let py_name = PyUnicode_FromString(name);
         if py_name.is_null() {
@@ -119,7 +133,11 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
         if int_object.is_null() {
             return -1;
         }
-        let safety_value = if is_safe.is_null() { SAFE_UUID_UNKNOWN } else { is_safe };
+        let safety_value = if is_safe.is_null() {
+            SAFE_UUID_UNKNOWN
+        } else {
+            is_safe
+        };
         if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
             set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
             Py_DECREF(int_object);
@@ -137,13 +155,26 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
 
 unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     let bytes = value.to_be_bytes();
-    unsafe { PyLong_FromUnsignedNativeBytes(bytes.as_ptr().cast(), bytes.len(), PY_ASNATIVEBYTES_BIG_ENDIAN) }
+    unsafe {
+        PyLong_FromUnsignedNativeBytes(
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            PY_ASNATIVEBYTES_BIG_ENDIAN,
+        )
+    }
 }
 
 unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     let mut bytes = [0u8; 16];
     let flags = PY_ASNATIVEBYTES_BIG_ENDIAN | PY_ASNATIVEBYTES_REJECT_NEGATIVE;
-    let written = unsafe { PyLong_AsNativeBytes(object, bytes.as_mut_ptr().cast(), bytes.len() as Py_ssize_t, flags) };
+    let written = unsafe {
+        PyLong_AsNativeBytes(
+            object,
+            bytes.as_mut_ptr().cast(),
+            bytes.len() as Py_ssize_t,
+            flags,
+        )
+    };
     if written < 0 || written > bytes.len() as Py_ssize_t {
         unsafe { PyErr_Clear() };
         return None;
@@ -227,6 +258,10 @@ unsafe fn call_original(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
+        if callable.is_null() {
+            PyErr_SetString(PyExc_TypeError, cstr!("invalid uuid function arguments"));
+            return ptr::null_mut();
+        }
         match original_vectorcall(callable) {
             Some(vectorcall) => vectorcall(callable, args, nargsf, kwnames),
             None => ptr::null_mut(),
@@ -251,8 +286,6 @@ unsafe fn keyword_name(kwnames: *mut PyObject, index: Py_ssize_t) -> *mut PyObje
 unsafe fn keyword_matches(kwnames: *mut PyObject, index: Py_ssize_t, name: *const c_char) -> bool {
     unsafe { PyUnicode_CompareWithASCIIString(keyword_name(kwnames, index), name) == 0 }
 }
-
-
 
 unsafe extern "C" fn uuid4_vectorcall(
     callable: *mut PyObject,
@@ -368,8 +401,16 @@ unsafe extern "C" fn uuid1_vectorcall(
         if positional_count > 2 || keyword_count(kwnames) > 2 {
             return call_original(callable, args, nargsf, kwnames);
         }
-        let mut node_object = if positional_count >= 1 { *args } else { ptr::null_mut() };
-        let mut clock_seq_object = if positional_count >= 2 { *args.add(1) } else { ptr::null_mut() };
+        let mut node_object = if positional_count >= 1 {
+            *args
+        } else {
+            ptr::null_mut()
+        };
+        let mut clock_seq_object = if positional_count >= 2 {
+            *args.add(1)
+        } else {
+            ptr::null_mut()
+        };
         for index in 0..keyword_count(kwnames) {
             let value = *args.add(positional_count as usize + index as usize);
             if keyword_matches(kwnames, index, cstr!("node")) {
@@ -432,7 +473,12 @@ unsafe extern "C" fn uuid1_vectorcall(
                 timestamp = last + 1;
             }
             if LAST_TIMESTAMP
-                .compare_exchange(last as u64, timestamp as u64, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(
+                    last as u64,
+                    timestamp as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 break;
@@ -455,6 +501,184 @@ unsafe extern "C" fn uuid1_vectorcall(
     }
 }
 
+unsafe fn uuid6_generate(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        let positional_count = PyVectorcall_NARGS(nargsf);
+        if positional_count > 2 || keyword_count(kwnames) > 2 {
+            return call_original(callable, args, nargsf, kwnames);
+        }
+        let mut node_object = if positional_count >= 1 {
+            *args
+        } else {
+            ptr::null_mut()
+        };
+        let mut clock_seq_object = if positional_count >= 2 {
+            *args.add(1)
+        } else {
+            ptr::null_mut()
+        };
+        for index in 0..keyword_count(kwnames) {
+            let value = *args.add(positional_count as usize + index as usize);
+            if keyword_matches(kwnames, index, cstr!("node")) {
+                if !node_object.is_null() {
+                    return call_original(callable, args, nargsf, kwnames);
+                }
+                node_object = value;
+            } else if keyword_matches(kwnames, index, cstr!("clock_seq")) {
+                if !clock_seq_object.is_null() {
+                    return call_original(callable, args, nargsf, kwnames);
+                }
+                clock_seq_object = value;
+            } else {
+                return call_original(callable, args, nargsf, kwnames);
+            }
+        }
+
+        let node = if node_object.is_null() || node_object == Py_None() {
+            let getnode = attribute(UUID_MODULE, cstr!("getnode"));
+            if getnode.is_null() {
+                return ptr::null_mut();
+            }
+            let result = PyObject_CallNoArgs(getnode);
+            Py_DECREF(getnode);
+            if result.is_null() {
+                return ptr::null_mut();
+            }
+            let Some(value) = pylong_to_u128(result) else {
+                Py_DECREF(result);
+                return call_original(callable, args, nargsf, kwnames);
+            };
+            Py_DECREF(result);
+            value
+        } else if let Some(value) = pylong_to_u128(node_object) {
+            value
+        } else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
+        if node >= (1u128 << 48) {
+            return call_original(callable, args, nargsf, kwnames);
+        }
+
+        let clock_seq = if clock_seq_object.is_null() || clock_seq_object == Py_None() {
+            let random_bytes = fastrand::u16(..).to_be_bytes();
+            u16::from_be_bytes(random_bytes) as u128 & 0x3fff
+        } else if let Some(value) = pylong_to_u128(clock_seq_object) {
+            value & 0x3fff
+        } else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
+
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration,
+            Err(_) => return call_original(callable, args, nargsf, kwnames),
+        };
+        let mut timestamp = (now.as_nanos() / 100) + UUID_EPOCH_OFFSET;
+        loop {
+            let last = LAST_TIMESTAMP_V6.load(Ordering::Relaxed) as u128;
+            if timestamp <= last {
+                timestamp = last + 1;
+            }
+            if LAST_TIMESTAMP_V6
+                .compare_exchange(
+                    last as u64,
+                    timestamp as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let time_hi_and_mid = (timestamp >> 12) & 0xffff_ffff_ffff;
+        let time_lo = timestamp & 0x0fff;
+        let clock_sequence = clock_seq & 0x3fff;
+        let value = (time_hi_and_mid << 80)
+            | (time_lo << 64)
+            | (clock_sequence << 48)
+            | (node & 0xffff_ffff_ffff)
+            | ((6u128 << 76) | (0x8000u128 << 48));
+        allocate_uuid(value, SAFE_UUID_UNKNOWN)
+    }
+}
+
+unsafe extern "C" fn uuid6_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid6_generate(callable, args, nargsf, kwnames) }
+}
+
+unsafe fn uuid7_generate() -> *mut PyObject {
+    unsafe {
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration,
+            Err(error) => {
+                PyErr_SetString(
+                    PyExc_OSError,
+                    std::ffi::CString::new(error.to_string()).unwrap().as_ptr(),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let mut timestamp_ms = (now.as_nanos() / 1_000_000) as u64;
+        let last_timestamp = LAST_TIMESTAMP_V7.load(Ordering::Relaxed);
+        let counter;
+        let tail;
+        if last_timestamp == 0 || timestamp_ms > last_timestamp {
+            counter = fastrand::u64(..) & 0x1ff_ffff_ffff;
+            tail = fastrand::u32(..);
+        } else {
+            if timestamp_ms < last_timestamp {
+                timestamp_ms = last_timestamp + 1;
+            }
+            let next_counter = LAST_COUNTER_V7.load(Ordering::Relaxed) + 1;
+            if next_counter > 0x3ff_ffff_ffff {
+                timestamp_ms += 1;
+                counter = fastrand::u64(..) & 0x1ff_ffff_ffff;
+                tail = fastrand::u32(..);
+            } else {
+                counter = next_counter;
+                tail = fastrand::u32(..);
+            }
+        }
+        LAST_TIMESTAMP_V7.store(timestamp_ms, Ordering::Relaxed);
+        LAST_COUNTER_V7.store(counter, Ordering::Relaxed);
+
+        let unix_timestamp_ms = (timestamp_ms as u128) & 0xffff_ffff_ffff;
+        let counter_hi = ((counter >> 30) as u128) & 0x0fff;
+        let counter_lo = (counter as u128) & 0x3fff_ffff;
+        let value = (unix_timestamp_ms << 80)
+            | (counter_hi << 64)
+            | (counter_lo << 32)
+            | tail as u128
+            | ((7u128 << 76) | (0x8000u128 << 48));
+        allocate_uuid(value, SAFE_UUID_UNKNOWN)
+    }
+}
+
+unsafe extern "C" fn uuid7_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        if PyVectorcall_NARGS(nargsf) != 0 || keyword_count(kwnames) != 0 {
+            return call_original(callable, args, nargsf, kwnames);
+        }
+        uuid7_generate()
+    }
+}
+
 unsafe fn unicode_to_string(object: *mut PyObject) -> Option<String> {
     unsafe {
         let utf8 = PyUnicode_AsUTF8AndSize(object, ptr::null_mut());
@@ -462,7 +686,11 @@ unsafe fn unicode_to_string(object: *mut PyObject) -> Option<String> {
             PyErr_Clear();
             None
         } else {
-            Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+            Some(
+                std::ffi::CStr::from_ptr(utf8)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         }
     }
 }
@@ -523,7 +751,14 @@ unsafe fn fields_to_uuid_int(object: *mut PyObject) -> Option<u128> {
         {
             return None;
         }
-        Some((values[0] << 96) | (values[1] << 80) | (values[2] << 64) | (values[3] << 56) | (values[4] << 48) | values[5])
+        Some(
+            (values[0] << 96)
+                | (values[1] << 80)
+                | (values[2] << 64)
+                | (values[3] << 56)
+                | (values[4] << 48)
+                | values[5],
+        )
     }
 }
 
@@ -539,12 +774,36 @@ unsafe extern "C" fn uuid_init_vectorcall(
             return call_original(callable, args, nargsf, kwnames);
         }
         let self_object = *args;
-        let mut hex_object = if positional_count >= 2 { *args.add(1) } else { Py_None() };
-        let mut bytes_object = if positional_count >= 3 { *args.add(2) } else { Py_None() };
-        let mut bytes_le_object = if positional_count >= 4 { *args.add(3) } else { Py_None() };
-        let mut fields_object = if positional_count >= 5 { *args.add(4) } else { Py_None() };
-        let mut int_object = if positional_count >= 6 { *args.add(5) } else { Py_None() };
-        let mut version_object = if positional_count >= 7 { *args.add(6) } else { Py_None() };
+        let mut hex_object = if positional_count >= 2 {
+            *args.add(1)
+        } else {
+            Py_None()
+        };
+        let mut bytes_object = if positional_count >= 3 {
+            *args.add(2)
+        } else {
+            Py_None()
+        };
+        let mut bytes_le_object = if positional_count >= 4 {
+            *args.add(3)
+        } else {
+            Py_None()
+        };
+        let mut fields_object = if positional_count >= 5 {
+            *args.add(4)
+        } else {
+            Py_None()
+        };
+        let mut int_object = if positional_count >= 6 {
+            *args.add(5)
+        } else {
+            Py_None()
+        };
+        let mut version_object = if positional_count >= 7 {
+            *args.add(6)
+        } else {
+            Py_None()
+        };
         let mut is_safe_object = SAFE_UUID_UNKNOWN;
 
         for index in 0..keyword_count(kwnames) {
@@ -572,8 +831,19 @@ unsafe extern "C" fn uuid_init_vectorcall(
             *target = value;
         }
 
-        let sources = [hex_object, bytes_object, bytes_le_object, fields_object, int_object];
-        if sources.iter().filter(|source| **source != Py_None()).count() != 1 {
+        let sources = [
+            hex_object,
+            bytes_object,
+            bytes_le_object,
+            fields_object,
+            int_object,
+        ];
+        if sources
+            .iter()
+            .filter(|source| **source != Py_None())
+            .count()
+            != 1
+        {
             return call_original(callable, args, nargsf, kwnames);
         }
 
@@ -627,7 +897,12 @@ unsafe extern "C" fn uuid_init_vectorcall(
     }
 }
 
-unsafe fn unary_self(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> Option<*mut PyObject> {
+unsafe fn unary_self(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> Option<*mut PyObject> {
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 1 || keyword_count(kwnames) != 0 {
             call_original(callable, args, nargsf, kwnames);
@@ -638,35 +913,74 @@ unsafe fn unary_self(callable: *mut PyObject, args: *const *mut PyObject, nargsf
     }
 }
 
-unsafe extern "C" fn uuid_str_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_str_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let hex = format!("{value:032x}");
-        let string = format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]);
+        let string = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
         PyUnicode_FromStringAndSize(string.as_ptr().cast(), string.len() as Py_ssize_t)
     }
 }
 
-unsafe extern "C" fn uuid_hex_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_hex_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let string = format!("{value:032x}");
         PyUnicode_FromStringAndSize(string.as_ptr().cast(), string.len() as Py_ssize_t)
     }
 }
 
-unsafe extern "C" fn uuid_repr_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_repr_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
         let class = PyObject_Type(self_object);
-        if class.is_null() { return ptr::null_mut(); }
+        if class.is_null() {
+            return ptr::null_mut();
+        }
         let name = attribute(class, cstr!("__name__"));
         Py_DECREF(class);
-        if name.is_null() { return ptr::null_mut(); }
+        if name.is_null() {
+            return ptr::null_mut();
+        }
         let string = uuid_str_vectorcall(callable, args, nargsf, kwnames);
-        if string.is_null() { Py_DECREF(name); return ptr::null_mut(); }
+        if string.is_null() {
+            Py_DECREF(name);
+            return ptr::null_mut();
+        }
         let result = PyUnicode_FromFormat(cstr!("%U('%U')"), name, string);
         Py_DECREF(name);
         Py_DECREF(string);
@@ -674,27 +988,54 @@ unsafe extern "C" fn uuid_repr_vectorcall(callable: *mut PyObject, args: *const 
     }
 }
 
-unsafe extern "C" fn uuid_int_method_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_int_method_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
         let int_object = attribute(self_object, cstr!("int"));
-        if int_object.is_null() { call_original(callable, args, nargsf, kwnames) } else { int_object }
+        if int_object.is_null() {
+            call_original(callable, args, nargsf, kwnames)
+        } else {
+            int_object
+        }
     }
 }
 
-unsafe extern "C" fn uuid_hash_method_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_hash_method_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
         let int_object = attribute(self_object, cstr!("int"));
-        if int_object.is_null() { return call_original(callable, args, nargsf, kwnames); }
+        if int_object.is_null() {
+            return call_original(callable, args, nargsf, kwnames);
+        }
         let hash = PyObject_Hash(int_object);
         Py_DECREF(int_object);
-        if hash == -1 && !PyErr_Occurred().is_null() { return ptr::null_mut(); }
+        if hash == -1 && !PyErr_Occurred().is_null() {
+            return ptr::null_mut();
+        }
         PyLong_FromSsize_t(hash)
     }
 }
 
-unsafe extern "C" fn uuid_setattr_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_setattr_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 3 || keyword_count(kwnames) != 0 {
             return call_original(callable, args, nargsf, kwnames);
@@ -721,7 +1062,12 @@ unsafe extern "C" fn uuid_setattr_vectorcall(callable: *mut PyObject, args: *con
     }
 }
 
-unsafe fn rich_compare<const OP: u8>(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe fn rich_compare<const OP: u8>(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 2 || keyword_count(kwnames) != 0 {
             return call_original(callable, args, nargsf, kwnames);
@@ -729,10 +1075,18 @@ unsafe fn rich_compare<const OP: u8>(callable: *mut PyObject, args: *const *mut 
         let self_object = *args;
         let other_object = *args.add(1);
         let instance_check = PyObject_IsInstance(other_object, UUID_TYPE);
-        if instance_check < 0 { return ptr::null_mut(); }
-        if instance_check == 0 { return not_implemented(); }
-        let Some(left) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
-        let Some(right) = uuid_int(other_object) else { return call_original(callable, args, nargsf, kwnames); };
+        if instance_check < 0 {
+            return ptr::null_mut();
+        }
+        if instance_check == 0 {
+            return not_implemented();
+        }
+        let Some(left) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
+        let Some(right) = uuid_int(other_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let result = match OP {
             0 => left == right,
             1 => left < right,
@@ -744,25 +1098,78 @@ unsafe fn rich_compare<const OP: u8>(callable: *mut PyObject, args: *const *mut 
     }
 }
 
-unsafe extern "C" fn uuid_eq_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { rich_compare::<0>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_lt_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { rich_compare::<1>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_gt_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { rich_compare::<2>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_le_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { rich_compare::<3>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_ge_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { rich_compare::<4>(callable, args, nargsf, kwnames) } }
+unsafe extern "C" fn uuid_eq_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { rich_compare::<0>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_lt_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { rich_compare::<1>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_gt_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { rich_compare::<2>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_le_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { rich_compare::<3>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_ge_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { rich_compare::<4>(callable, args, nargsf, kwnames) }
+}
 
-unsafe extern "C" fn uuid_bytes_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_bytes_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let bytes = value.to_be_bytes();
         PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t)
     }
 }
 
-unsafe extern "C" fn uuid_bytes_le_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_bytes_le_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let mut bytes = value.to_be_bytes();
         bytes[0..4].reverse();
         bytes[4..6].reverse();
@@ -771,34 +1178,68 @@ unsafe extern "C" fn uuid_bytes_le_vectorcall(callable: *mut PyObject, args: *co
     }
 }
 
-unsafe fn pylong_from_u128_lossless(value: u128) -> *mut PyObject { unsafe { u128_to_pylong(value) } }
+unsafe fn pylong_from_u128_lossless(value: u128) -> *mut PyObject {
+    unsafe { u128_to_pylong(value) }
+}
 
 unsafe fn tuple_set_u128(tuple: *mut PyObject, index: Py_ssize_t, value: u128) -> c_int {
     unsafe {
         let object = pylong_from_u128_lossless(value);
-        if object.is_null() { return -1; }
+        if object.is_null() {
+            return -1;
+        }
         PyTuple_SetItem(tuple, index, object)
     }
 }
 
-unsafe extern "C" fn uuid_fields_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_fields_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let tuple = PyTuple_New(6);
-        if tuple.is_null() { return ptr::null_mut(); }
-        let values = [value >> 96, (value >> 80) & 0xffff, (value >> 64) & 0xffff, (value >> 56) & 0xff, (value >> 48) & 0xff, value & 0xffffffffffff];
+        if tuple.is_null() {
+            return ptr::null_mut();
+        }
+        let values = [
+            value >> 96,
+            (value >> 80) & 0xffff,
+            (value >> 64) & 0xffff,
+            (value >> 56) & 0xff,
+            (value >> 48) & 0xff,
+            value & 0xffffffffffff,
+        ];
         for (index, item) in values.iter().enumerate() {
-            if tuple_set_u128(tuple, index as Py_ssize_t, *item) < 0 { Py_DECREF(tuple); return ptr::null_mut(); }
+            if tuple_set_u128(tuple, index as Py_ssize_t, *item) < 0 {
+                Py_DECREF(tuple);
+                return ptr::null_mut();
+            }
         }
         tuple
     }
 }
 
-unsafe extern "C" fn uuid_field_value_vectorcall<const FIELD: u8>(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_field_value_vectorcall<const FIELD: u8>(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let field_value = match FIELD {
             0 => value >> 96,
             1 => (value >> 80) & 0xffff,
@@ -813,29 +1254,101 @@ unsafe extern "C" fn uuid_field_value_vectorcall<const FIELD: u8>(callable: *mut
     }
 }
 
-unsafe extern "C" fn uuid_time_low_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<0>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_time_mid_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<1>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_time_hi_version_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<2>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_clock_seq_hi_variant_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<3>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_clock_seq_low_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<4>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_time_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<5>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_clock_seq_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<6>(callable, args, nargsf, kwnames) } }
-unsafe extern "C" fn uuid_node_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject { unsafe { uuid_field_value_vectorcall::<7>(callable, args, nargsf, kwnames) } }
+unsafe extern "C" fn uuid_time_low_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<0>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_time_mid_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<1>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_time_hi_version_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<2>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_clock_seq_hi_variant_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<3>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_clock_seq_low_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<4>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_time_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<5>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_clock_seq_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<6>(callable, args, nargsf, kwnames) }
+}
+unsafe extern "C" fn uuid_node_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid_field_value_vectorcall::<7>(callable, args, nargsf, kwnames) }
+}
 
-unsafe extern "C" fn uuid_urn_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_urn_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
         let string = uuid_str_vectorcall(callable, args, nargsf, kwnames);
-        if string.is_null() { return ptr::null_mut(); }
+        if string.is_null() {
+            return ptr::null_mut();
+        }
         let result = PyUnicode_FromFormat(cstr!("urn:uuid:%U"), string);
         Py_DECREF(string);
         result
     }
 }
 
-unsafe extern "C" fn uuid_variant_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_variant_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         let result = if value & (0x8000u128 << 48) == 0 {
             RESERVED_NCS_VALUE
         } else if value & (0x4000u128 << 48) == 0 {
@@ -849,10 +1362,19 @@ unsafe extern "C" fn uuid_variant_vectorcall(callable: *mut PyObject, args: *con
     }
 }
 
-unsafe extern "C" fn uuid_version_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_version_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else { return ptr::null_mut(); };
-        let Some(value) = uuid_int(self_object) else { return call_original(callable, args, nargsf, kwnames); };
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
+            return ptr::null_mut();
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
         if value & (0x8000u128 << 48) != 0 && value & (0x4000u128 << 48) == 0 {
             PyLong_FromLong(((value >> 76) & 0xf) as c_long)
         } else {
@@ -861,11 +1383,21 @@ unsafe extern "C" fn uuid_version_vectorcall(callable: *mut PyObject, args: *con
     }
 }
 
-unsafe extern "C" fn uuid_getstate_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_getstate_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe { call_original(callable, args, nargsf, kwnames) }
 }
 
-unsafe extern "C" fn uuid_setstate_vectorcall(callable: *mut PyObject, args: *const *mut PyObject, nargsf: usize, kwnames: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn uuid_setstate_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
     unsafe { call_original(callable, args, nargsf, kwnames) }
 }
 
@@ -874,14 +1406,21 @@ unsafe fn patch_function(function: *mut PyObject, vectorcall: vectorcallfunc) ->
         let current = match PyVectorcall_Function(function) {
             Some(current) => current,
             None => {
-                PyErr_SetString(PyExc_RuntimeError, cstr!("uuideal: function has no vectorcall slot"));
+                PyErr_SetString(
+                    PyExc_RuntimeError,
+                    cstr!("uuideal: function has no vectorcall slot"),
+                );
                 return -1;
             }
         };
         if PyObject_HasAttrString(function, CAPSULE_NAME) != 0 {
             return 0;
         }
-        let capsule = PyCapsule_New(std::mem::transmute::<vectorcallfunc, *mut c_void>(current), CAPSULE_NAME, None);
+        let capsule = PyCapsule_New(
+            std::mem::transmute::<vectorcallfunc, *mut c_void>(current),
+            CAPSULE_NAME,
+            None,
+        );
         if capsule.is_null() {
             return -1;
         }
@@ -915,10 +1454,33 @@ unsafe fn restore_function(function: *mut PyObject) -> c_int {
     }
 }
 
-unsafe fn patch_module_function(module: *mut PyObject, name: *const c_char, vectorcall: vectorcallfunc) -> c_int {
+unsafe fn patch_module_function(
+    module: *mut PyObject,
+    name: *const c_char,
+    vectorcall: vectorcallfunc,
+) -> c_int {
     unsafe {
         let function = attribute(module, name);
-        if function.is_null() { return -1; }
+        if function.is_null() {
+            return -1;
+        }
+        let result = patch_function(function, vectorcall);
+        Py_DECREF(function);
+        result
+    }
+}
+
+unsafe fn patch_optional_module_function(
+    module: *mut PyObject,
+    name: *const c_char,
+    vectorcall: vectorcallfunc,
+) -> c_int {
+    unsafe {
+        let function = attribute(module, name);
+        if function.is_null() {
+            PyErr_Clear();
+            return 0;
+        }
         let result = patch_function(function, vectorcall);
         Py_DECREF(function);
         result
@@ -928,7 +1490,10 @@ unsafe fn patch_module_function(module: *mut PyObject, name: *const c_char, vect
 unsafe fn restore_module_function(module: *mut PyObject, name: *const c_char) -> c_int {
     unsafe {
         let function = attribute(module, name);
-        if function.is_null() { PyErr_Clear(); return 0; }
+        if function.is_null() {
+            PyErr_Clear();
+            return 0;
+        }
         let result = restore_function(function);
         Py_DECREF(function);
         result
@@ -938,7 +1503,9 @@ unsafe fn restore_module_function(module: *mut PyObject, name: *const c_char) ->
 unsafe fn patch_uuid_method(name: *const c_char, vectorcall: vectorcallfunc) -> c_int {
     unsafe {
         let function = attribute(UUID_TYPE, name);
-        if function.is_null() { return -1; }
+        if function.is_null() {
+            return -1;
+        }
         let result = patch_function(function, vectorcall);
         Py_DECREF(function);
         result
@@ -948,7 +1515,10 @@ unsafe fn patch_uuid_method(name: *const c_char, vectorcall: vectorcallfunc) -> 
 unsafe fn restore_uuid_method(name: *const c_char) -> c_int {
     unsafe {
         let function = attribute(UUID_TYPE, name);
-        if function.is_null() { PyErr_Clear(); return 0; }
+        if function.is_null() {
+            PyErr_Clear();
+            return 0;
+        }
         let result = restore_function(function);
         Py_DECREF(function);
         result
@@ -958,10 +1528,14 @@ unsafe fn restore_uuid_method(name: *const c_char) -> c_int {
 unsafe fn patch_uuid_property(name: *const c_char, vectorcall: vectorcallfunc) -> c_int {
     unsafe {
         let property = attribute(UUID_TYPE, name);
-        if property.is_null() { return -1; }
+        if property.is_null() {
+            return -1;
+        }
         let getter = attribute(property, cstr!("fget"));
         Py_DECREF(property);
-        if getter.is_null() { return -1; }
+        if getter.is_null() {
+            return -1;
+        }
         let result = patch_function(getter, vectorcall);
         Py_DECREF(getter);
         result
@@ -971,16 +1545,21 @@ unsafe fn patch_uuid_property(name: *const c_char, vectorcall: vectorcallfunc) -
 unsafe fn restore_uuid_property(name: *const c_char) -> c_int {
     unsafe {
         let property = attribute(UUID_TYPE, name);
-        if property.is_null() { PyErr_Clear(); return 0; }
+        if property.is_null() {
+            PyErr_Clear();
+            return 0;
+        }
         let getter = attribute(property, cstr!("fget"));
         Py_DECREF(property);
-        if getter.is_null() { PyErr_Clear(); return 0; }
+        if getter.is_null() {
+            PyErr_Clear();
+            return 0;
+        }
         let result = restore_function(getter);
         Py_DECREF(getter);
         result
     }
 }
-
 
 unsafe fn member_descriptor_offset(descriptor: *mut PyObject) -> Option<Py_ssize_t> {
     unsafe {
@@ -1006,7 +1585,10 @@ unsafe fn load_uuid_slot_offsets() -> c_int {
         xdecref(int_descriptor);
         xdecref(is_safe_descriptor);
         let (Some(int_offset), Some(is_safe_offset)) = (int_offset, is_safe_offset) else {
-            PyErr_SetString(PyExc_RuntimeError, cstr!("uuideal: unable to resolve UUID slot offsets"));
+            PyErr_SetString(
+                PyExc_RuntimeError,
+                cstr!("uuideal: unable to resolve UUID slot offsets"),
+            );
             return -1;
         };
         INT_SLOT_OFFSET = int_offset;
@@ -1016,20 +1598,32 @@ unsafe fn load_uuid_slot_offsets() -> c_int {
 }
 unsafe fn load_uuid_references() -> c_int {
     unsafe {
-        if !UUID_MODULE.is_null() { return 0; }
+        if !UUID_MODULE.is_null() {
+            return 0;
+        }
         let module = PyImport_ImportModule(cstr!("uuid"));
-        if module.is_null() { return -1; }
+        if module.is_null() {
+            return -1;
+        }
         UUID_MODULE = module;
         UUID_TYPE = attribute(module, cstr!("UUID"));
         let safe_uuid = attribute(module, cstr!("SafeUUID"));
-        if safe_uuid.is_null() { return -1; }
+        if safe_uuid.is_null() {
+            return -1;
+        }
         SAFE_UUID_UNKNOWN = attribute(safe_uuid, cstr!("unknown"));
         Py_DECREF(safe_uuid);
         RESERVED_NCS_VALUE = attribute(module, cstr!("RESERVED_NCS"));
         RFC_4122_VALUE = attribute(module, cstr!("RFC_4122"));
         RESERVED_MICROSOFT_VALUE = attribute(module, cstr!("RESERVED_MICROSOFT"));
         RESERVED_FUTURE_VALUE = attribute(module, cstr!("RESERVED_FUTURE"));
-        if UUID_TYPE.is_null() || SAFE_UUID_UNKNOWN.is_null() || RESERVED_NCS_VALUE.is_null() || RFC_4122_VALUE.is_null() || RESERVED_MICROSOFT_VALUE.is_null() || RESERVED_FUTURE_VALUE.is_null() {
+        if UUID_TYPE.is_null()
+            || SAFE_UUID_UNKNOWN.is_null()
+            || RESERVED_NCS_VALUE.is_null()
+            || RFC_4122_VALUE.is_null()
+            || RESERVED_MICROSOFT_VALUE.is_null()
+            || RESERVED_FUTURE_VALUE.is_null()
+        {
             return -1;
         }
         if load_uuid_slot_offsets() < 0 {
@@ -1041,48 +1635,107 @@ unsafe fn load_uuid_references() -> c_int {
 
 unsafe fn apply_all_patches() -> c_int {
     unsafe {
-        if load_uuid_references() < 0 { return -1; }
+        if load_uuid_references() < 0 {
+            return -1;
+        }
         let module_patches = [
             (cstr!("uuid1"), uuid1_vectorcall as vectorcallfunc),
             (cstr!("uuid3"), uuid3_vectorcall as vectorcallfunc),
             (cstr!("uuid4"), uuid4_vectorcall as vectorcallfunc),
             (cstr!("uuid5"), uuid5_vectorcall as vectorcallfunc),
         ];
-        for (name, vectorcall) in module_patches { if patch_module_function(UUID_MODULE, name, vectorcall) < 0 { return -1; } }
+        for (name, vectorcall) in module_patches {
+            if patch_module_function(UUID_MODULE, name, vectorcall) < 0 {
+                return -1;
+            }
+        }
+        let optional_module_patches = [
+            (cstr!("uuid6"), uuid6_vectorcall as vectorcallfunc),
+            (cstr!("uuid7"), uuid7_vectorcall as vectorcallfunc),
+        ];
+        for (name, vectorcall) in optional_module_patches {
+            if patch_optional_module_function(UUID_MODULE, name, vectorcall) < 0 {
+                return -1;
+            }
+        }
         let method_patches = [
             (cstr!("__init__"), uuid_init_vectorcall as vectorcallfunc),
-            (cstr!("__getstate__"), uuid_getstate_vectorcall as vectorcallfunc),
-            (cstr!("__setstate__"), uuid_setstate_vectorcall as vectorcallfunc),
+            (
+                cstr!("__getstate__"),
+                uuid_getstate_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("__setstate__"),
+                uuid_setstate_vectorcall as vectorcallfunc,
+            ),
             (cstr!("__eq__"), uuid_eq_vectorcall as vectorcallfunc),
             (cstr!("__lt__"), uuid_lt_vectorcall as vectorcallfunc),
             (cstr!("__gt__"), uuid_gt_vectorcall as vectorcallfunc),
             (cstr!("__le__"), uuid_le_vectorcall as vectorcallfunc),
             (cstr!("__ge__"), uuid_ge_vectorcall as vectorcallfunc),
-            (cstr!("__hash__"), uuid_hash_method_vectorcall as vectorcallfunc),
-            (cstr!("__int__"), uuid_int_method_vectorcall as vectorcallfunc),
+            (
+                cstr!("__hash__"),
+                uuid_hash_method_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("__int__"),
+                uuid_int_method_vectorcall as vectorcallfunc,
+            ),
             (cstr!("__repr__"), uuid_repr_vectorcall as vectorcallfunc),
-            (cstr!("__setattr__"), uuid_setattr_vectorcall as vectorcallfunc),
+            (
+                cstr!("__setattr__"),
+                uuid_setattr_vectorcall as vectorcallfunc,
+            ),
             (cstr!("__str__"), uuid_str_vectorcall as vectorcallfunc),
         ];
-        for (name, vectorcall) in method_patches { if patch_uuid_method(name, vectorcall) < 0 { return -1; } }
+        for (name, vectorcall) in method_patches {
+            if patch_uuid_method(name, vectorcall) < 0 {
+                return -1;
+            }
+        }
         let property_patches = [
             (cstr!("bytes"), uuid_bytes_vectorcall as vectorcallfunc),
-            (cstr!("bytes_le"), uuid_bytes_le_vectorcall as vectorcallfunc),
+            (
+                cstr!("bytes_le"),
+                uuid_bytes_le_vectorcall as vectorcallfunc,
+            ),
             (cstr!("fields"), uuid_fields_vectorcall as vectorcallfunc),
-            (cstr!("time_low"), uuid_time_low_vectorcall as vectorcallfunc),
-            (cstr!("time_mid"), uuid_time_mid_vectorcall as vectorcallfunc),
-            (cstr!("time_hi_version"), uuid_time_hi_version_vectorcall as vectorcallfunc),
-            (cstr!("clock_seq_hi_variant"), uuid_clock_seq_hi_variant_vectorcall as vectorcallfunc),
-            (cstr!("clock_seq_low"), uuid_clock_seq_low_vectorcall as vectorcallfunc),
+            (
+                cstr!("time_low"),
+                uuid_time_low_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("time_mid"),
+                uuid_time_mid_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("time_hi_version"),
+                uuid_time_hi_version_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("clock_seq_hi_variant"),
+                uuid_clock_seq_hi_variant_vectorcall as vectorcallfunc,
+            ),
+            (
+                cstr!("clock_seq_low"),
+                uuid_clock_seq_low_vectorcall as vectorcallfunc,
+            ),
             (cstr!("time"), uuid_time_vectorcall as vectorcallfunc),
-            (cstr!("clock_seq"), uuid_clock_seq_vectorcall as vectorcallfunc),
+            (
+                cstr!("clock_seq"),
+                uuid_clock_seq_vectorcall as vectorcallfunc,
+            ),
             (cstr!("node"), uuid_node_vectorcall as vectorcallfunc),
             (cstr!("hex"), uuid_hex_vectorcall as vectorcallfunc),
             (cstr!("urn"), uuid_urn_vectorcall as vectorcallfunc),
             (cstr!("variant"), uuid_variant_vectorcall as vectorcallfunc),
             (cstr!("version"), uuid_version_vectorcall as vectorcallfunc),
         ];
-        for (name, vectorcall) in property_patches { if patch_uuid_property(name, vectorcall) < 0 { return -1; } }
+        for (name, vectorcall) in property_patches {
+            if patch_uuid_property(name, vectorcall) < 0 {
+                return -1;
+            }
+        }
         PyType_Modified(UUID_TYPE.cast::<PyTypeObject>());
         0
     }
@@ -1090,19 +1743,104 @@ unsafe fn apply_all_patches() -> c_int {
 
 unsafe fn restore_all_patches() -> c_int {
     unsafe {
-        if UUID_MODULE.is_null() { return 0; }
-        for name in [cstr!("uuid1"), cstr!("uuid3"), cstr!("uuid4"), cstr!("uuid5")] { if restore_module_function(UUID_MODULE, name) < 0 { return -1; } }
-        for name in [cstr!("__init__"), cstr!("__getstate__"), cstr!("__setstate__"), cstr!("__eq__"), cstr!("__lt__"), cstr!("__gt__"), cstr!("__le__"), cstr!("__ge__"), cstr!("__hash__"), cstr!("__int__"), cstr!("__repr__"), cstr!("__setattr__"), cstr!("__str__")] { if restore_uuid_method(name) < 0 { return -1; } }
-        for name in [cstr!("bytes"), cstr!("bytes_le"), cstr!("fields"), cstr!("time_low"), cstr!("time_mid"), cstr!("time_hi_version"), cstr!("clock_seq_hi_variant"), cstr!("clock_seq_low"), cstr!("time"), cstr!("clock_seq"), cstr!("node"), cstr!("hex"), cstr!("urn"), cstr!("variant"), cstr!("version")] { if restore_uuid_property(name) < 0 { return -1; } }
+        if UUID_MODULE.is_null() {
+            return 0;
+        }
+        for name in [
+            cstr!("uuid1"),
+            cstr!("uuid3"),
+            cstr!("uuid4"),
+            cstr!("uuid5"),
+            cstr!("uuid6"),
+            cstr!("uuid7"),
+        ] {
+            if restore_module_function(UUID_MODULE, name) < 0 {
+                return -1;
+            }
+        }
+        for name in [
+            cstr!("__init__"),
+            cstr!("__getstate__"),
+            cstr!("__setstate__"),
+            cstr!("__eq__"),
+            cstr!("__lt__"),
+            cstr!("__gt__"),
+            cstr!("__le__"),
+            cstr!("__ge__"),
+            cstr!("__hash__"),
+            cstr!("__int__"),
+            cstr!("__repr__"),
+            cstr!("__setattr__"),
+            cstr!("__str__"),
+        ] {
+            if restore_uuid_method(name) < 0 {
+                return -1;
+            }
+        }
+        for name in [
+            cstr!("bytes"),
+            cstr!("bytes_le"),
+            cstr!("fields"),
+            cstr!("time_low"),
+            cstr!("time_mid"),
+            cstr!("time_hi_version"),
+            cstr!("clock_seq_hi_variant"),
+            cstr!("clock_seq_low"),
+            cstr!("time"),
+            cstr!("clock_seq"),
+            cstr!("node"),
+            cstr!("hex"),
+            cstr!("urn"),
+            cstr!("variant"),
+            cstr!("version"),
+        ] {
+            if restore_uuid_property(name) < 0 {
+                return -1;
+            }
+        }
         PyType_Modified(UUID_TYPE.cast::<PyTypeObject>());
         0
+    }
+}
+
+unsafe extern "C" fn py_uuid6(
+    _self: *mut PyObject,
+    args: *const *mut PyObject,
+    nargs: Py_ssize_t,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        if load_uuid_references() < 0 {
+            return ptr::null_mut();
+        }
+        uuid6_generate(ptr::null_mut(), args, nargs as usize, kwnames)
+    }
+}
+
+unsafe extern "C" fn py_uuid7(
+    _self: *mut PyObject,
+    _args: *const *mut PyObject,
+    nargs: Py_ssize_t,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        if load_uuid_references() < 0 {
+            return ptr::null_mut();
+        }
+        if nargs != 0 || keyword_count(kwnames) != 0 {
+            PyErr_SetString(PyExc_TypeError, cstr!("uuid7() takes no arguments"));
+            return ptr::null_mut();
+        }
+        uuid7_generate()
     }
 }
 
 unsafe extern "C" fn py_enable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if !PATCHED.load(Ordering::SeqCst) {
-            if apply_all_patches() < 0 { return ptr::null_mut(); }
+            if apply_all_patches() < 0 {
+                return ptr::null_mut();
+            }
             PATCHED.store(true, Ordering::SeqCst);
         }
         none()
@@ -1112,7 +1850,9 @@ unsafe extern "C" fn py_enable(_self: *mut PyObject, _args: *mut PyObject) -> *m
 unsafe extern "C" fn py_disable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if PATCHED.load(Ordering::SeqCst) {
-            if restore_all_patches() < 0 { return ptr::null_mut(); }
+            if restore_all_patches() < 0 {
+                return ptr::null_mut();
+            }
             PATCHED.store(false, Ordering::SeqCst);
         }
         none()
@@ -1123,16 +1863,67 @@ unsafe extern "C" fn py_is_enabled(_self: *mut PyObject, _args: *mut PyObject) -
     unsafe { PyBool_FromLong(PATCHED.load(Ordering::SeqCst) as c_long) }
 }
 
-static mut METHODS: [PyMethodDef; 6] = [PyMethodDef::zeroed(); 6];
+static mut METHODS: [PyMethodDef; 8] = [PyMethodDef::zeroed(); 8];
 
 unsafe fn init_methods() {
     unsafe {
-        METHODS[0] = PyMethodDef { ml_name: cstr!("enable"), ml_meth: PyMethodDefPointer { PyCFunction: py_enable }, ml_flags: METH_NOARGS, ml_doc: cstr!("Enable uuid vectorcall patches.") };
-        METHODS[1] = PyMethodDef { ml_name: cstr!("install"), ml_meth: PyMethodDefPointer { PyCFunction: py_enable }, ml_flags: METH_NOARGS, ml_doc: cstr!("Enable uuid vectorcall patches.") };
-        METHODS[2] = PyMethodDef { ml_name: cstr!("disable"), ml_meth: PyMethodDefPointer { PyCFunction: py_disable }, ml_flags: METH_NOARGS, ml_doc: cstr!("Disable uuid vectorcall patches.") };
-        METHODS[3] = PyMethodDef { ml_name: cstr!("uninstall"), ml_meth: PyMethodDefPointer { PyCFunction: py_disable }, ml_flags: METH_NOARGS, ml_doc: cstr!("Disable uuid vectorcall patches.") };
-        METHODS[4] = PyMethodDef { ml_name: cstr!("is_enabled"), ml_meth: PyMethodDefPointer { PyCFunction: py_is_enabled }, ml_flags: METH_NOARGS, ml_doc: cstr!("Return whether uuid vectorcall patches are enabled.") };
-        METHODS[5] = PyMethodDef::zeroed();
+        METHODS[0] = PyMethodDef {
+            ml_name: cstr!("enable"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_enable,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: cstr!("Enable uuid vectorcall patches."),
+        };
+        METHODS[1] = PyMethodDef {
+            ml_name: cstr!("install"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_enable,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: cstr!("Enable uuid vectorcall patches."),
+        };
+        METHODS[2] = PyMethodDef {
+            ml_name: cstr!("disable"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_disable,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: cstr!("Disable uuid vectorcall patches."),
+        };
+        METHODS[3] = PyMethodDef {
+            ml_name: cstr!("uninstall"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_disable,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: cstr!("Disable uuid vectorcall patches."),
+        };
+        METHODS[4] = PyMethodDef {
+            ml_name: cstr!("is_enabled"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_is_enabled,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: cstr!("Return whether uuid vectorcall patches are enabled."),
+        };
+        METHODS[5] = PyMethodDef {
+            ml_name: cstr!("uuid6"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunctionFastWithKeywords: py_uuid6,
+            },
+            ml_flags: METH_FASTCALL | METH_KEYWORDS,
+            ml_doc: cstr!("Generate a version 6 UUID."),
+        };
+        METHODS[6] = PyMethodDef {
+            ml_name: cstr!("uuid7"),
+            ml_meth: PyMethodDefPointer {
+                PyCFunctionFastWithKeywords: py_uuid7,
+            },
+            ml_flags: METH_FASTCALL | METH_KEYWORDS,
+            ml_doc: cstr!("Generate a version 7 UUID."),
+        };
+        METHODS[7] = PyMethodDef::zeroed();
     }
 }
 
