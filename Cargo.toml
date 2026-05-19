@@ -1,0 +1,28 @@
+[package]
+name = "uuideal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+[lib]
+name = "uuideal"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3-ffi = { version = "0.28.2", features = ["extension-module", "generate-import-lib"] }
+getrandom = "0.3"
+md-5 = "0.10"
+sha1 = "0.10"
+
+[build-dependencies]
+pyo3-build-config = "0.28.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+incremental = true
+codegen-units = 16

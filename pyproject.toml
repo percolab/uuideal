@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3-ffi/extension-module"]
+module-name = "uuideal._uuideal"
+python-source = "."
+
+[project]
+name = "uuideal"
+dynamic = ["version"]
+description = "Vectorcall patches for stdlib uuid powered by Rust"
+readme = "README.md"
+authors = [{ name = "Arseny Boykov (Bobronium)", email = "hi@bobronium.me" }]
+requires-python = ">=3.12"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+dev = ["uuideal[test]", "maturin>=1.0,<2.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
