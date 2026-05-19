@@ -21,6 +21,7 @@ const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
 static PATCHED: AtomicBool = AtomicBool::new(false);
 static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
+
 static mut UUID_MODULE: *mut PyObject = ptr::null_mut();
 static mut UUID_TYPE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_UNKNOWN: *mut PyObject = ptr::null_mut();
@@ -28,6 +29,31 @@ static mut RESERVED_NCS_VALUE: *mut PyObject = ptr::null_mut();
 static mut RFC_4122_VALUE: *mut PyObject = ptr::null_mut();
 static mut RESERVED_MICROSOFT_VALUE: *mut PyObject = ptr::null_mut();
 static mut RESERVED_FUTURE_VALUE: *mut PyObject = ptr::null_mut();
+static mut INT_SLOT_OFFSET: Py_ssize_t = -1;
+static mut IS_SAFE_SLOT_OFFSET: Py_ssize_t = -1;
+
+#[repr(C)]
+struct PyDescrObjectLayout {
+    ob_base: PyObject,
+    d_type: *mut PyTypeObject,
+    d_name: *mut PyObject,
+    d_qualname: *mut PyObject,
+}
+
+#[repr(C)]
+struct PyMemberDefLayout {
+    name: *const c_char,
+    member_type: c_int,
+    offset: Py_ssize_t,
+    flags: c_int,
+    doc: *const c_char,
+}
+
+#[repr(C)]
+struct PyMemberDescrObjectLayout {
+    d_common: PyDescrObjectLayout,
+    d_member: *mut PyMemberDefLayout,
+}
 
 #[cfg_attr(windows, link(name = "pythonXY"))]
 extern "C" {
@@ -41,6 +67,14 @@ unsafe fn incref(object: *mut PyObject) -> *mut PyObject {
     unsafe {
         Py_INCREF(object);
         object
+    }
+}
+
+unsafe fn xdecref(object: *mut PyObject) {
+    unsafe {
+        if !object.is_null() {
+            Py_DECREF(object);
+        }
     }
 }
 
@@ -69,18 +103,34 @@ unsafe fn generic_set_attribute(object: *mut PyObject, name: *const c_char, valu
     }
 }
 
+unsafe fn set_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *mut PyObject) {
+    unsafe {
+        let slot = object.cast::<u8>().offset(offset).cast::<*mut PyObject>();
+        let previous = *slot;
+        Py_INCREF(value);
+        *slot = value;
+        xdecref(previous);
+    }
+}
+
 unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObject) -> c_int {
     unsafe {
         let int_object = u128_to_pylong(value);
         if int_object.is_null() {
             return -1;
         }
+        let safety_value = if is_safe.is_null() { SAFE_UUID_UNKNOWN } else { is_safe };
+        if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
+            set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
+            Py_DECREF(int_object);
+            set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+            return 0;
+        }
         if generic_set_attribute(object, cstr!("int"), int_object) < 0 {
             Py_DECREF(int_object);
             return -1;
         }
         Py_DECREF(int_object);
-        let safety_value = if is_safe.is_null() { SAFE_UUID_UNKNOWN } else { is_safe };
         generic_set_attribute(object, cstr!("is_safe"), safety_value)
     }
 }
@@ -203,6 +253,7 @@ unsafe fn keyword_matches(kwnames: *mut PyObject, index: Py_ssize_t, name: *cons
 }
 
 
+
 unsafe extern "C" fn uuid4_vectorcall(
     callable: *mut PyObject,
     args: *const *mut PyObject,
@@ -213,11 +264,7 @@ unsafe extern "C" fn uuid4_vectorcall(
         if PyVectorcall_NARGS(nargsf) != 0 || keyword_count(kwnames) != 0 {
             return call_original(callable, args, nargsf, kwnames);
         }
-        let mut bytes = [0u8; 16];
-        if let Err(error) = getrandom::fill(&mut bytes) {
-            PyErr_SetString(PyExc_OSError, std::ffi::CString::new(error.to_string()).unwrap().as_ptr());
-            return ptr::null_mut();
-        }
+        let mut bytes = fastrand::u128(..).to_be_bytes();
         set_random_version_and_variant(&mut bytes, 4);
         allocate_uuid(u128::from_be_bytes(bytes), SAFE_UUID_UNKNOWN)
     }
@@ -366,10 +413,7 @@ unsafe extern "C" fn uuid1_vectorcall(
         }
 
         let clock_seq = if clock_seq_object.is_null() || clock_seq_object == Py_None() {
-            let mut random_bytes = [0u8; 2];
-            if getrandom::fill(&mut random_bytes).is_err() {
-                return ptr::null_mut();
-            }
+            let random_bytes = fastrand::u16(..).to_be_bytes();
             u16::from_be_bytes(random_bytes) as u128 & 0x3fff
         } else if let Some(value) = pylong_to_u128(clock_seq_object) {
             value & 0x3fff
@@ -655,6 +699,23 @@ unsafe extern "C" fn uuid_setattr_vectorcall(callable: *mut PyObject, args: *con
         if PyVectorcall_NARGS(nargsf) != 3 || keyword_count(kwnames) != 0 {
             return call_original(callable, args, nargsf, kwnames);
         }
+        let self_object = *args;
+        let name = *args.add(1);
+        let value = *args.add(2);
+        let object_type = PyObject_Type(self_object);
+        if object_type.is_null() {
+            return ptr::null_mut();
+        }
+        let is_exact_uuid = object_type == UUID_TYPE;
+        Py_DECREF(object_type);
+        let is_uuid_slot = PyUnicode_CompareWithASCIIString(name, cstr!("int")) == 0
+            || PyUnicode_CompareWithASCIIString(name, cstr!("is_safe")) == 0;
+        if !is_exact_uuid && !is_uuid_slot {
+            if PyObject_GenericSetAttr(self_object, name, value) < 0 {
+                return ptr::null_mut();
+            }
+            return none();
+        }
         PyErr_SetString(PyExc_TypeError, cstr!("UUID objects are immutable"));
         ptr::null_mut()
     }
@@ -920,6 +981,39 @@ unsafe fn restore_uuid_property(name: *const c_char) -> c_int {
     }
 }
 
+
+unsafe fn member_descriptor_offset(descriptor: *mut PyObject) -> Option<Py_ssize_t> {
+    unsafe {
+        if descriptor.is_null() {
+            return None;
+        }
+        let member_descriptor = descriptor.cast::<PyMemberDescrObjectLayout>();
+        let member = (*member_descriptor).d_member;
+        if member.is_null() {
+            None
+        } else {
+            Some((*member).offset)
+        }
+    }
+}
+
+unsafe fn load_uuid_slot_offsets() -> c_int {
+    unsafe {
+        let int_descriptor = attribute(UUID_TYPE, cstr!("int"));
+        let is_safe_descriptor = attribute(UUID_TYPE, cstr!("is_safe"));
+        let int_offset = member_descriptor_offset(int_descriptor);
+        let is_safe_offset = member_descriptor_offset(is_safe_descriptor);
+        xdecref(int_descriptor);
+        xdecref(is_safe_descriptor);
+        let (Some(int_offset), Some(is_safe_offset)) = (int_offset, is_safe_offset) else {
+            PyErr_SetString(PyExc_RuntimeError, cstr!("uuideal: unable to resolve UUID slot offsets"));
+            return -1;
+        };
+        INT_SLOT_OFFSET = int_offset;
+        IS_SAFE_SLOT_OFFSET = is_safe_offset;
+        0
+    }
+}
 unsafe fn load_uuid_references() -> c_int {
     unsafe {
         if !UUID_MODULE.is_null() { return 0; }
@@ -927,12 +1021,18 @@ unsafe fn load_uuid_references() -> c_int {
         if module.is_null() { return -1; }
         UUID_MODULE = module;
         UUID_TYPE = attribute(module, cstr!("UUID"));
-        SAFE_UUID_UNKNOWN = attribute(attribute(module, cstr!("SafeUUID")), cstr!("unknown"));
+        let safe_uuid = attribute(module, cstr!("SafeUUID"));
+        if safe_uuid.is_null() { return -1; }
+        SAFE_UUID_UNKNOWN = attribute(safe_uuid, cstr!("unknown"));
+        Py_DECREF(safe_uuid);
         RESERVED_NCS_VALUE = attribute(module, cstr!("RESERVED_NCS"));
         RFC_4122_VALUE = attribute(module, cstr!("RFC_4122"));
         RESERVED_MICROSOFT_VALUE = attribute(module, cstr!("RESERVED_MICROSOFT"));
         RESERVED_FUTURE_VALUE = attribute(module, cstr!("RESERVED_FUTURE"));
         if UUID_TYPE.is_null() || SAFE_UUID_UNKNOWN.is_null() || RESERVED_NCS_VALUE.is_null() || RFC_4122_VALUE.is_null() || RESERVED_MICROSOFT_VALUE.is_null() || RESERVED_FUTURE_VALUE.is_null() {
+            return -1;
+        }
+        if load_uuid_slot_offsets() < 0 {
             return -1;
         }
         0
