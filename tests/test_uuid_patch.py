@@ -6,10 +6,41 @@ import sys
 import threading
 import timeit
 import uuid
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
 import uuideal
+
+
+UUID_ATTRIBUTE = (
+    "int",
+    "bytes",
+    "bytes_le",
+    "hex",
+    "fields",
+    "time_low",
+    "time_mid",
+    "time_hi_version",
+    "clock_seq_hi_variant",
+    "clock_seq_low",
+    "node",
+    "time",
+    "clock_seq",
+    "urn",
+    "variant",
+    "version",
+    "is_safe",
+)
+
+UUID_SPECIAL_CALLABLE_ATTRIBUTES = (
+    "__repr__",
+    "__str__",
+    "__hash__",
+    "__int__",
+    "__dir__",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -19,36 +50,30 @@ def clean_patch_state():
     uuideal.uninstall()
 
 
-def assert_uuid_equivalent(left: uuid.UUID, right: uuid.UUID) -> None:
-    assert type(right) is uuid.UUID
-    for attribute_name in (
-        "int",
-        "bytes",
-        "bytes_le",
-        "hex",
-        "fields",
-        "time_low",
-        "time_mid",
-        "time_hi_version",
-        "clock_seq_hi_variant",
-        "clock_seq_low",
-        "node",
-        "time",
-        "clock_seq",
-        "urn",
-        "variant",
-        "version",
-        "is_safe",
-    ):
-        assert getattr(right, attribute_name) == getattr(left, attribute_name), attribute_name
-    assert repr(right) == repr(left)
-    assert str(right) == str(left)
-    assert hash(right) == hash(left)
-    assert right == left
-    assert int(right) == int(left)
-    assert bool(right) == bool(left)
-    assert dir(right) == dir(left)
-    assert sys.getsizeof(right) == sys.getsizeof(left)
+@dataclass
+class Snapshot:
+    instance: uuid.UUID
+    instance_attributes: dict[str, Any]
+    class_attributes: dict[str, Any]
+    special_values: dict[str, Any]
+    size: int
+
+
+def snapshot(candidate: uuid.UUID) -> Snapshot:
+    instance_attributes = {
+        attribute: object.__getattribute__(candidate, attribute)
+        for attribute in UUID_ATTRIBUTE
+    }
+    candidate_cls = type(candidate)
+    class_attributes = {
+        attribute: object.__getattribute__(candidate_cls, attribute)
+        for attribute in (*UUID_ATTRIBUTE, *UUID_SPECIAL_CALLABLE_ATTRIBUTES)
+    }
+    special_values = {name: getattr(candidate, name)() for name in UUID_SPECIAL_CALLABLE_ATTRIBUTES}
+
+    return Snapshot(
+        candidate, instance_attributes, class_attributes, special_values, sys.getsizeof(candidate)
+    )
 
 
 def test_install_preserves_function_identities() -> None:
@@ -70,7 +95,7 @@ def test_install_preserves_function_identities() -> None:
         assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
-    assert uuideal.is_enabled()
+    assert uuideal.enabled()
 
     uuideal.uninstall()
     uuideal.uninstall()
@@ -83,7 +108,7 @@ def test_install_preserves_function_identities() -> None:
         assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
-    assert not uuideal.is_enabled()
+    assert not uuideal.enabled()
 
 
 @pytest.mark.parametrize(
@@ -102,30 +127,34 @@ def test_install_preserves_function_identities() -> None:
 )
 def test_uuid_constructor_paths_match_stdlib(constructor_kwargs, constructor_args) -> None:
     expected = uuid.UUID(*constructor_args, **constructor_kwargs)
+    expected_snapshot = snapshot(expected)
     uuideal.install()
     actual = uuid.UUID(*constructor_args, **constructor_kwargs)
-    assert_uuid_equivalent(expected, actual)
+    snapshot(actual) == expected_snapshot
 
 
 def test_patched_properties_work_on_unpatched_objects() -> None:
     stdlib_object = uuid.UUID("12345678-1234-5678-9234-567812345678")
-    expected_values = {name: getattr(stdlib_object, name) for name in (
-        "bytes",
-        "bytes_le",
-        "hex",
-        "fields",
-        "time_low",
-        "time_mid",
-        "time_hi_version",
-        "clock_seq_hi_variant",
-        "clock_seq_low",
-        "node",
-        "time",
-        "clock_seq",
-        "urn",
-        "variant",
-        "version",
-    )}
+    expected_values = {
+        name: getattr(stdlib_object, name)
+        for name in (
+            "bytes",
+            "bytes_le",
+            "hex",
+            "fields",
+            "time_low",
+            "time_mid",
+            "time_hi_version",
+            "clock_seq_hi_variant",
+            "clock_seq_low",
+            "node",
+            "time",
+            "clock_seq",
+            "urn",
+            "variant",
+            "version",
+        )
+    }
 
     uuideal.install()
 
@@ -143,9 +172,10 @@ def test_patched_properties_work_on_unpatched_objects() -> None:
 @pytest.mark.parametrize("name", ["", "python.org", "тест", b"bytes-name"])
 def test_deterministic_factories_match_stdlib(factory, namespace, name) -> None:
     expected = factory(namespace, name)
+    expected_snapshot = snapshot(expected)
     uuideal.install()
     actual = factory(namespace, name)
-    assert_uuid_equivalent(expected, actual)
+    assert snapshot(actual) == expected_snapshot
     assert actual.variant == uuid.RFC_4122
 
 
@@ -209,6 +239,7 @@ def test_uuid7_shortcut_and_patch_have_expected_fields() -> None:
         assert len({value.int for value in patched_values}) == len(patched_values)
         assert patched_values == sorted(patched_values)
 
+
 def test_error_equivalence_for_representative_invalid_inputs() -> None:
     invalid_calls = [
         lambda: uuid.UUID(),
@@ -216,7 +247,9 @@ def test_error_equivalence_for_representative_invalid_inputs() -> None:
         lambda: uuid.UUID(bytes=b"short"),
         lambda: uuid.UUID(int=1 << 128),
         lambda: uuid.UUID(fields=(1, 2, 3)),
-        lambda: uuid.UUID("12345678123456781234567812345678", hex="12345678123456781234567812345678"),
+        lambda: uuid.UUID(
+            "12345678123456781234567812345678", hex="12345678123456781234567812345678"
+        ),
         lambda: uuid.uuid4(1),
         lambda: uuid.uuid3(uuid.NAMESPACE_DNS),
     ]
