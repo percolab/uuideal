@@ -11,9 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3-ffi = { version = "0.28.2", features = ["extension-module", "generate-import-lib"] }
-fastrand = "2"
-md-5 = "0.10"
-sha1 = "0.10"
+uuid = { version = "1", features = ["v1", "v3", "v4", "v5", "v6", "v7"] }
+
 
 [build-dependencies]
 pyo3-build-config = "0.28.2"

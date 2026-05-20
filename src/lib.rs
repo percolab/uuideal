@@ -3,11 +3,9 @@
 #[cfg(not(Py_3_13))]
 use core::ffi::c_uchar;
 use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
-use md5::{Digest, Md5};
 use pyo3_ffi::*;
-use sha1::Sha1;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 macro_rules! cstr {
     ($value:literal) => {
@@ -16,17 +14,12 @@ macro_rules! cstr {
 }
 
 const CAPSULE_NAME: *const c_char = cstr!("uuideal._original_vectorcall");
-const UUID_EPOCH_OFFSET: u128 = 0x01b21dd213814000;
 #[cfg(Py_3_13)]
 const PY_ASNATIVEBYTES_BIG_ENDIAN: c_int = 0;
 #[cfg(Py_3_13)]
 const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
 
 static PATCHED: AtomicBool = AtomicBool::new(false);
-static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-static LAST_TIMESTAMP_V6: AtomicU64 = AtomicU64::new(0);
-static LAST_TIMESTAMP_V7: AtomicU64 = AtomicU64::new(0);
-static LAST_COUNTER_V7: AtomicU64 = AtomicU64::new(0);
 
 static mut UUID_MODULE: *mut PyObject = ptr::null_mut();
 static mut UUID_TYPE: *mut PyObject = ptr::null_mut();
@@ -464,9 +457,15 @@ fn apply_version_with_max(value: u128, version: u8, max_version: u8) -> Option<u
     Some((with_variant & !(0xf000u128 << 64)) | ((version as u128) << 76))
 }
 
-fn set_random_version_and_variant(bytes: &mut [u8; 16], version: u8) {
-    bytes[6] = (bytes[6] & 0x0f) | (version << 4);
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+fn node_to_bytes(node: u128) -> [u8; 6] {
+    [
+        (node >> 40) as u8,
+        (node >> 32) as u8,
+        (node >> 24) as u8,
+        (node >> 16) as u8,
+        (node >> 8) as u8,
+        node as u8,
+    ]
 }
 
 unsafe fn allocate_uuid(value: u128, is_safe: *mut PyObject) -> *mut PyObject {
@@ -545,9 +544,7 @@ unsafe extern "C" fn uuid4_vectorcall(
         if PyVectorcall_NARGS(nargsf) != 0 || keyword_count(kwnames) != 0 {
             return call_original(callable, args, nargsf, kwnames);
         }
-        let mut bytes = fastrand::u128(..).to_be_bytes();
-        set_random_version_and_variant(&mut bytes, 4);
-        allocate_uuid(u128::from_be_bytes(bytes), SAFE_UUID_UNKNOWN)
+        allocate_uuid(uuid::Uuid::new_v4().as_u128(), SAFE_UUID_UNKNOWN)
     }
 }
 
@@ -573,12 +570,6 @@ unsafe fn name_bytes(name: *mut PyObject) -> Option<Vec<u8>> {
     }
 }
 
-unsafe fn namespace_bytes(namespace: *mut PyObject) -> Option<[u8; 16]> {
-    unsafe {
-        let value = uuid_int(namespace)?;
-        Some(value.to_be_bytes())
-    }
-}
 
 unsafe fn uuid_hash_vectorcall<const VERSION: u8>(
     callable: *mut PyObject,
@@ -592,31 +583,19 @@ unsafe fn uuid_hash_vectorcall<const VERSION: u8>(
         }
         let namespace = *args;
         let name = *args.add(1);
-        let Some(namespace_bytes) = namespace_bytes(namespace) else {
+        let Some(namespace_value) = uuid_int(namespace) else {
             return call_original(callable, args, nargsf, kwnames);
         };
         let Some(name_bytes) = name_bytes(name) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let mut digest = if VERSION == 3 {
-            let mut hasher = Md5::new();
-            hasher.update(namespace_bytes);
-            hasher.update(name_bytes);
-            let output = hasher.finalize();
-            let mut digest = [0u8; 16];
-            digest.copy_from_slice(&output[..16]);
-            digest
+        let ns = uuid::Uuid::from_u128(namespace_value);
+        let value = if VERSION == 3 {
+            uuid::Uuid::new_v3(&ns, &name_bytes).as_u128()
         } else {
-            let mut hasher = Sha1::new();
-            hasher.update(namespace_bytes);
-            hasher.update(name_bytes);
-            let output = hasher.finalize();
-            let mut digest = [0u8; 16];
-            digest.copy_from_slice(&output[..16]);
-            digest
+            uuid::Uuid::new_v5(&ns, &name_bytes).as_u128()
         };
-        set_random_version_and_variant(&mut digest, VERSION);
-        allocate_uuid(u128::from_be_bytes(digest), SAFE_UUID_UNKNOWN)
+        allocate_uuid(value, SAFE_UUID_UNKNOWN)
     }
 }
 
@@ -638,16 +617,17 @@ unsafe extern "C" fn uuid5_vectorcall(
     unsafe { uuid_hash_vectorcall::<5>(callable, args, nargsf, kwnames) }
 }
 
-unsafe extern "C" fn uuid1_vectorcall(
+unsafe fn parse_node_and_clock_seq(
     callable: *mut PyObject,
     args: *const *mut PyObject,
     nargsf: usize,
     kwnames: *mut PyObject,
-) -> *mut PyObject {
+) -> Option<(*mut PyObject, *mut PyObject)> {
     unsafe {
         let positional_count = PyVectorcall_NARGS(nargsf);
         if positional_count > 2 || keyword_count(kwnames) > 2 {
-            return call_original(callable, args, nargsf, kwnames);
+            call_original(callable, args, nargsf, kwnames);
+            return None;
         }
         let mut node_object = if positional_count >= 1 {
             *args
@@ -663,89 +643,123 @@ unsafe extern "C" fn uuid1_vectorcall(
             let value = *args.add(positional_count as usize + index as usize);
             if keyword_matches(kwnames, index, cstr!("node")) {
                 if !node_object.is_null() {
-                    return call_original(callable, args, nargsf, kwnames);
+                    call_original(callable, args, nargsf, kwnames);
+                    return None;
                 }
                 node_object = value;
             } else if keyword_matches(kwnames, index, cstr!("clock_seq")) {
                 if !clock_seq_object.is_null() {
-                    return call_original(callable, args, nargsf, kwnames);
+                    call_original(callable, args, nargsf, kwnames);
+                    return None;
                 }
                 clock_seq_object = value;
             } else {
-                return call_original(callable, args, nargsf, kwnames);
+                call_original(callable, args, nargsf, kwnames);
+                return None;
             }
         }
+        Some((node_object, clock_seq_object))
+    }
+}
 
+unsafe fn resolve_node(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+    node_object: *mut PyObject,
+) -> Option<u128> {
+    unsafe {
         let node = if node_object.is_null() || node_object == Py_None() {
             let getnode = attribute(UUID_MODULE, cstr!("getnode"));
             if getnode.is_null() {
-                return ptr::null_mut();
+                return None;
             }
             let result = PyObject_CallNoArgs(getnode);
             Py_DECREF(getnode);
             if result.is_null() {
-                return ptr::null_mut();
+                return None;
             }
             let Some(value) = pylong_to_u128(result) else {
                 Py_DECREF(result);
-                return call_original(callable, args, nargsf, kwnames);
+                call_original(callable, args, nargsf, kwnames);
+                return None;
             };
             Py_DECREF(result);
             value
         } else if let Some(value) = pylong_to_u128(node_object) {
             value
         } else {
-            return call_original(callable, args, nargsf, kwnames);
+            call_original(callable, args, nargsf, kwnames);
+            return None;
         };
         if node >= (1u128 << 48) {
-            return call_original(callable, args, nargsf, kwnames);
+            call_original(callable, args, nargsf, kwnames);
+            return None;
         }
+        Some(node)
+    }
+}
 
-        let clock_seq = if clock_seq_object.is_null() || clock_seq_object == Py_None() {
-            let random_bytes = fastrand::u16(..).to_be_bytes();
-            u16::from_be_bytes(random_bytes) as u128 & 0x3fff
-        } else if let Some(value) = pylong_to_u128(clock_seq_object) {
-            value & 0x3fff
+unsafe fn generate_timestamp_uuid(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+    node_bytes: &[u8; 6],
+    clock_seq_object: *mut PyObject,
+    sorted: bool,
+) -> *mut PyObject {
+    unsafe {
+        let value = if clock_seq_object.is_null() || clock_seq_object == Py_None() {
+            if sorted {
+                uuid::Uuid::now_v6(node_bytes).as_u128()
+            } else {
+                uuid::Uuid::now_v1(node_bytes).as_u128()
+            }
+        } else if let Some(clock_seq_value) = pylong_to_u128(clock_seq_object) {
+            let clock_seq = (clock_seq_value & 0x3fff) as u16;
+            let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => duration,
+                Err(_) => return call_original(callable, args, nargsf, kwnames),
+            };
+            let ts = uuid::Timestamp::from_unix(
+                uuid::ContextV1::new_random(),
+                now.as_secs(),
+                now.subsec_nanos(),
+            );
+            let ticks = ts.to_gregorian().0;
+            if sorted {
+                uuid::Builder::from_sorted_gregorian_timestamp(ticks, clock_seq, node_bytes)
+            } else {
+                uuid::Builder::from_gregorian_timestamp(ticks, clock_seq, node_bytes)
+            }
+            .into_uuid()
+            .as_u128()
         } else {
             return call_original(callable, args, nargsf, kwnames);
         };
-
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => duration,
-            Err(_) => return call_original(callable, args, nargsf, kwnames),
-        };
-        let mut timestamp = (now.as_nanos() / 100) + UUID_EPOCH_OFFSET;
-        loop {
-            let last = LAST_TIMESTAMP.load(Ordering::Relaxed) as u128;
-            if timestamp <= last {
-                timestamp = last + 1;
-            }
-            if LAST_TIMESTAMP
-                .compare_exchange(
-                    last as u64,
-                    timestamp as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        let time_low = timestamp & 0xffff_ffff;
-        let time_mid = (timestamp >> 32) & 0xffff;
-        let time_hi_version = (timestamp >> 48) & 0x0fff;
-        let clock_seq_low = clock_seq & 0xff;
-        let clock_seq_hi_variant = (clock_seq >> 8) & 0x3f;
-        let value = (time_low << 96)
-            | (time_mid << 80)
-            | (time_hi_version << 64)
-            | (clock_seq_hi_variant << 56)
-            | (clock_seq_low << 48)
-            | node;
-        let value = apply_version_with_max(value, 1, 8).unwrap();
         allocate_uuid(value, SAFE_UUID_UNKNOWN)
+    }
+}
+
+unsafe extern "C" fn uuid1_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        let Some((node_object, clock_seq_object)) =
+            parse_node_and_clock_seq(callable, args, nargsf, kwnames)
+        else {
+            return ptr::null_mut();
+        };
+        let Some(node) = resolve_node(callable, args, nargsf, kwnames, node_object) else {
+            return ptr::null_mut();
+        };
+        let node_bytes = node_to_bytes(node);
+        generate_timestamp_uuid(callable, args, nargsf, kwnames, &node_bytes, clock_seq_object, false)
     }
 }
 
@@ -756,103 +770,16 @@ unsafe fn uuid6_generate(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let positional_count = PyVectorcall_NARGS(nargsf);
-        if positional_count > 2 || keyword_count(kwnames) > 2 {
-            return call_original(callable, args, nargsf, kwnames);
-        }
-        let mut node_object = if positional_count >= 1 {
-            *args
-        } else {
-            ptr::null_mut()
+        let Some((node_object, clock_seq_object)) =
+            parse_node_and_clock_seq(callable, args, nargsf, kwnames)
+        else {
+            return ptr::null_mut();
         };
-        let mut clock_seq_object = if positional_count >= 2 {
-            *args.add(1)
-        } else {
-            ptr::null_mut()
+        let Some(node) = resolve_node(callable, args, nargsf, kwnames, node_object) else {
+            return ptr::null_mut();
         };
-        for index in 0..keyword_count(kwnames) {
-            let value = *args.add(positional_count as usize + index as usize);
-            if keyword_matches(kwnames, index, cstr!("node")) {
-                if !node_object.is_null() {
-                    return call_original(callable, args, nargsf, kwnames);
-                }
-                node_object = value;
-            } else if keyword_matches(kwnames, index, cstr!("clock_seq")) {
-                if !clock_seq_object.is_null() {
-                    return call_original(callable, args, nargsf, kwnames);
-                }
-                clock_seq_object = value;
-            } else {
-                return call_original(callable, args, nargsf, kwnames);
-            }
-        }
-
-        let node = if node_object.is_null() || node_object == Py_None() {
-            let getnode = attribute(UUID_MODULE, cstr!("getnode"));
-            if getnode.is_null() {
-                return ptr::null_mut();
-            }
-            let result = PyObject_CallNoArgs(getnode);
-            Py_DECREF(getnode);
-            if result.is_null() {
-                return ptr::null_mut();
-            }
-            let Some(value) = pylong_to_u128(result) else {
-                Py_DECREF(result);
-                return call_original(callable, args, nargsf, kwnames);
-            };
-            Py_DECREF(result);
-            value
-        } else if let Some(value) = pylong_to_u128(node_object) {
-            value
-        } else {
-            return call_original(callable, args, nargsf, kwnames);
-        };
-        if node >= (1u128 << 48) {
-            return call_original(callable, args, nargsf, kwnames);
-        }
-
-        let clock_seq = if clock_seq_object.is_null() || clock_seq_object == Py_None() {
-            let random_bytes = fastrand::u16(..).to_be_bytes();
-            u16::from_be_bytes(random_bytes) as u128 & 0x3fff
-        } else if let Some(value) = pylong_to_u128(clock_seq_object) {
-            value & 0x3fff
-        } else {
-            return call_original(callable, args, nargsf, kwnames);
-        };
-
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => duration,
-            Err(_) => return call_original(callable, args, nargsf, kwnames),
-        };
-        let mut timestamp = (now.as_nanos() / 100) + UUID_EPOCH_OFFSET;
-        loop {
-            let last = LAST_TIMESTAMP_V6.load(Ordering::Relaxed) as u128;
-            if timestamp <= last {
-                timestamp = last + 1;
-            }
-            if LAST_TIMESTAMP_V6
-                .compare_exchange(
-                    last as u64,
-                    timestamp as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        let time_hi_and_mid = (timestamp >> 12) & 0xffff_ffff_ffff;
-        let time_lo = timestamp & 0x0fff;
-        let clock_sequence = clock_seq & 0x3fff;
-        let value = (time_hi_and_mid << 80)
-            | (time_lo << 64)
-            | (clock_sequence << 48)
-            | (node & 0xffff_ffff_ffff)
-            | ((6u128 << 76) | (0x8000u128 << 48));
-        allocate_uuid(value, SAFE_UUID_UNKNOWN)
+        let node_bytes = node_to_bytes(node);
+        generate_timestamp_uuid(callable, args, nargsf, kwnames, &node_bytes, clock_seq_object, true)
     }
 }
 
@@ -867,49 +794,7 @@ unsafe extern "C" fn uuid6_vectorcall(
 
 unsafe fn uuid7_generate() -> *mut PyObject {
     unsafe {
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => duration,
-            Err(error) => {
-                PyErr_SetString(
-                    PyExc_OSError,
-                    std::ffi::CString::new(error.to_string()).unwrap().as_ptr(),
-                );
-                return ptr::null_mut();
-            }
-        };
-        let mut timestamp_ms = (now.as_nanos() / 1_000_000) as u64;
-        let last_timestamp = LAST_TIMESTAMP_V7.load(Ordering::Relaxed);
-        let counter;
-        let tail;
-        if last_timestamp == 0 || timestamp_ms > last_timestamp {
-            counter = fastrand::u64(..) & 0x1ff_ffff_ffff;
-            tail = fastrand::u32(..);
-        } else {
-            if timestamp_ms < last_timestamp {
-                timestamp_ms = last_timestamp + 1;
-            }
-            let next_counter = LAST_COUNTER_V7.load(Ordering::Relaxed) + 1;
-            if next_counter > 0x3ff_ffff_ffff {
-                timestamp_ms += 1;
-                counter = fastrand::u64(..) & 0x1ff_ffff_ffff;
-                tail = fastrand::u32(..);
-            } else {
-                counter = next_counter;
-                tail = fastrand::u32(..);
-            }
-        }
-        LAST_TIMESTAMP_V7.store(timestamp_ms, Ordering::Relaxed);
-        LAST_COUNTER_V7.store(counter, Ordering::Relaxed);
-
-        let unix_timestamp_ms = (timestamp_ms as u128) & 0xffff_ffff_ffff;
-        let counter_hi = ((counter >> 30) as u128) & 0x0fff;
-        let counter_lo = (counter as u128) & 0x3fff_ffff;
-        let value = (unix_timestamp_ms << 80)
-            | (counter_hi << 64)
-            | (counter_lo << 32)
-            | tail as u128
-            | ((7u128 << 76) | (0x8000u128 << 48));
-        allocate_uuid(value, SAFE_UUID_UNKNOWN)
+        allocate_uuid(uuid::Uuid::now_v7().as_u128(), SAFE_UUID_UNKNOWN)
     }
 }
 
