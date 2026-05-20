@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
-use core::ffi::{c_char, c_int, c_long, c_void};
+#[cfg(not(Py_3_13))]
+use core::ffi::c_uchar;
+use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
 use md5::{Digest, Md5};
 use pyo3_ffi::*;
 use sha1::Sha1;
@@ -15,7 +17,9 @@ macro_rules! cstr {
 
 const CAPSULE_NAME: *const c_char = cstr!("uuideal._original_vectorcall");
 const UUID_EPOCH_OFFSET: u128 = 0x01b21dd213814000;
+#[cfg(Py_3_13)]
 const PY_ASNATIVEBYTES_BIG_ENDIAN: c_int = 0;
+#[cfg(Py_3_13)]
 const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
 
 static PATCHED: AtomicBool = AtomicBool::new(false);
@@ -33,6 +37,36 @@ static mut RESERVED_MICROSOFT_VALUE: *mut PyObject = ptr::null_mut();
 static mut RESERVED_FUTURE_VALUE: *mut PyObject = ptr::null_mut();
 static mut INT_SLOT_OFFSET: Py_ssize_t = -1;
 static mut IS_SAFE_SLOT_OFFSET: Py_ssize_t = -1;
+static mut NAME_INT: *mut PyObject = ptr::null_mut();
+static mut NAME_IS_SAFE: *mut PyObject = ptr::null_mut();
+static mut NAME_BYTES: *mut PyObject = ptr::null_mut();
+static mut NAME_BYTES_LE: *mut PyObject = ptr::null_mut();
+static mut NAME_FIELDS: *mut PyObject = ptr::null_mut();
+static mut NAME_TIME_LOW: *mut PyObject = ptr::null_mut();
+static mut NAME_TIME_MID: *mut PyObject = ptr::null_mut();
+static mut NAME_TIME_HI_VERSION: *mut PyObject = ptr::null_mut();
+static mut NAME_CLOCK_SEQ_HI_VARIANT: *mut PyObject = ptr::null_mut();
+static mut NAME_CLOCK_SEQ_LOW: *mut PyObject = ptr::null_mut();
+static mut NAME_TIME: *mut PyObject = ptr::null_mut();
+static mut NAME_CLOCK_SEQ: *mut PyObject = ptr::null_mut();
+static mut NAME_NODE: *mut PyObject = ptr::null_mut();
+static mut NAME_HEX: *mut PyObject = ptr::null_mut();
+static mut NAME_URN: *mut PyObject = ptr::null_mut();
+static mut NAME_VARIANT: *mut PyObject = ptr::null_mut();
+static mut NAME_VERSION: *mut PyObject = ptr::null_mut();
+static mut MAX_UUID_VERSION: u8 = 5;
+const UUID_GETSET_COUNT: usize = 15;
+const EMPTY_GETSET_DEF: PyGetSetDef = PyGetSetDef {
+    name: ptr::null(),
+    get: None,
+    set: None,
+    doc: ptr::null(),
+    closure: ptr::null_mut(),
+};
+static mut UUID_GETSET_DEFS: [PyGetSetDef; UUID_GETSET_COUNT + 1] =
+    [EMPTY_GETSET_DEF; UUID_GETSET_COUNT + 1];
+static mut ORIGINAL_UUID_PROPERTIES: [*mut PyObject; UUID_GETSET_COUNT] =
+    [ptr::null_mut(); UUID_GETSET_COUNT];
 
 #[repr(C)]
 struct PyDescrObjectLayout {
@@ -57,21 +91,48 @@ struct PyMemberDescrObjectLayout {
     d_member: *mut PyMemberDefLayout,
 }
 
+#[repr(C)]
+struct PyASCIIObjectLayout {
+    ob_base: PyObject,
+    length: Py_ssize_t,
+    hash: Py_hash_t,
+    state: u32,
+}
+
 #[cfg_attr(windows, link(name = "pythonXY"))]
 extern "C" {
     fn PyFunction_SetVectorcall(callable: *mut PyObject, vectorcall: vectorcallfunc);
     fn PyVectorcall_Function(callable: *mut PyObject) -> Option<vectorcallfunc>;
+    #[cfg(Py_3_13)]
     fn PyLong_FromUnsignedNativeBytes(
         buffer: *const c_void,
         n_bytes: usize,
         flags: c_int,
     ) -> *mut PyObject;
+    #[cfg(Py_3_13)]
     fn PyLong_AsNativeBytes(
         value: *mut PyObject,
         buffer: *mut c_void,
         n_bytes: Py_ssize_t,
         flags: c_int,
     ) -> Py_ssize_t;
+    #[cfg(not(Py_3_13))]
+    fn _PyLong_FromByteArray(
+        bytes: *const c_uchar,
+        n: usize,
+        little_endian: c_int,
+        is_signed: c_int,
+    ) -> *mut PyObject;
+    #[cfg(not(Py_3_13))]
+    fn _PyLong_AsByteArray(
+        value: *mut PyLongObject,
+        bytes: *mut c_uchar,
+        n: usize,
+        little_endian: c_int,
+        is_signed: c_int,
+        with_exceptions: c_int,
+    ) -> c_int;
+    fn PyUnicode_New(size: Py_ssize_t, maxchar: u32) -> *mut PyObject;
 }
 
 unsafe fn incref(object: *mut PyObject) -> *mut PyObject {
@@ -153,6 +214,7 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
     }
 }
 
+#[cfg(Py_3_13)]
 unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     let bytes = value.to_be_bytes();
     unsafe {
@@ -164,6 +226,13 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     }
 }
 
+#[cfg(not(Py_3_13))]
+unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
+    let bytes = value.to_be_bytes();
+    unsafe { _PyLong_FromByteArray(bytes.as_ptr(), bytes.len(), 0, 0) }
+}
+
+#[cfg(Py_3_13)]
 unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     let mut bytes = [0u8; 16];
     let flags = PY_ASNATIVEBYTES_BIG_ENDIAN | PY_ASNATIVEBYTES_REJECT_NEGATIVE;
@@ -182,8 +251,99 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     Some(u128::from_be_bytes(bytes))
 }
 
+#[cfg(not(Py_3_13))]
+unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
+    let mut bytes = [0u8; 16];
+    let result = unsafe {
+        _PyLong_AsByteArray(
+            object.cast::<PyLongObject>(),
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            0,
+            0,
+            1,
+        )
+    };
+    if result < 0 {
+        unsafe { PyErr_Clear() };
+        return None;
+    }
+    Some(u128::from_be_bytes(bytes))
+}
+
+const PYLONG_SHIFT: u32 = 30;
+
+#[repr(C)]
+struct PyLongInternals {
+    ob_refcnt: Py_ssize_t,
+    ob_type: *mut PyTypeObject,
+    #[cfg(not(Py_3_12))]
+    ob_size: Py_ssize_t,
+    #[cfg(Py_3_12)]
+    lv_tag: usize,
+    ob_digit: [u32; 0],
+}
+
+unsafe fn pylong_to_u128_fast(object: *mut PyObject) -> Option<u128> {
+    unsafe {
+        let long = object.cast::<PyLongInternals>();
+
+        #[cfg(not(Py_3_12))]
+        let ndigits = {
+            let s = (*long).ob_size;
+            if s < 0 {
+                return None;
+            }
+            s as usize
+        };
+
+        #[cfg(Py_3_12)]
+        let ndigits = {
+            let tag = (*long).lv_tag;
+            match tag & 3 {
+                2 => return None,    // negative
+                1 => return Some(0), // zero
+                _ => {}
+            }
+            tag >> 3
+        };
+
+        if ndigits > 5 {
+            return None;
+        }
+
+        let digits = (*long).ob_digit.as_ptr();
+        let mut value: u128 = 0;
+        let mut i = ndigits;
+        while i > 0 {
+            i -= 1;
+            value = (value << PYLONG_SHIFT) | (*digits.add(i) as u128);
+        }
+        Some(value)
+    }
+}
+
+unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
+    unsafe {
+        if INT_SLOT_OFFSET < 0 {
+            return None;
+        }
+        let int_object = *(object
+            .cast::<u8>()
+            .offset(INT_SLOT_OFFSET)
+            .cast::<*mut PyObject>());
+        if int_object.is_null() {
+            return None;
+        }
+        pylong_to_u128_fast(int_object)
+    }
+}
+
 unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
     unsafe {
+        if let Some(value) = uuid_int_from_slot(object) {
+            return Some(value);
+        }
         let int_object = attribute(object, cstr!("int"));
         if int_object.is_null() {
             return None;
@@ -191,6 +351,172 @@ unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
         let value = pylong_to_u128(int_object);
         Py_DECREF(int_object);
         value
+    }
+}
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+fn write_hex_32(value: u128, output: &mut [u8]) {
+    let mut shift = 124u32;
+    for byte in output.iter_mut().take(32) {
+        *byte = HEX_DIGITS[((value >> shift) & 0x0f) as usize];
+        shift = shift.saturating_sub(4);
+    }
+}
+
+fn write_uuid_string(value: u128, output: &mut [u8; 36]) {
+    let mut compact = [0u8; 32];
+    write_hex_32(value, &mut compact);
+    output[0..8].copy_from_slice(&compact[0..8]);
+    output[8] = b'-';
+    output[9..13].copy_from_slice(&compact[8..12]);
+    output[13] = b'-';
+    output[14..18].copy_from_slice(&compact[12..16]);
+    output[18] = b'-';
+    output[19..23].copy_from_slice(&compact[16..20]);
+    output[23] = b'-';
+    output[24..36].copy_from_slice(&compact[20..32]);
+}
+
+unsafe fn py_ascii_from_bytes(bytes: &[u8]) -> *mut PyObject {
+    unsafe {
+        let unicode = PyUnicode_New(bytes.len() as Py_ssize_t, 127);
+        if unicode.is_null() {
+            return ptr::null_mut();
+        }
+        let data = unicode
+            .cast::<u8>()
+            .add(std::mem::size_of::<PyASCIIObjectLayout>());
+        ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+        unicode
+    }
+}
+
+unsafe fn uuid_hex_object(value: u128) -> *mut PyObject {
+    let mut bytes = [0u8; 32];
+    write_hex_32(value, &mut bytes);
+    unsafe { py_ascii_from_bytes(&bytes) }
+}
+
+unsafe fn uuid_string_object(value: u128) -> *mut PyObject {
+    let mut bytes = [0u8; 36];
+    write_uuid_string(value, &mut bytes);
+    unsafe { py_ascii_from_bytes(&bytes) }
+}
+
+unsafe fn uuid_bytes_object(value: u128) -> *mut PyObject {
+    let bytes = value.to_be_bytes();
+    unsafe { PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t) }
+}
+
+unsafe fn uuid_bytes_le_object(value: u128) -> *mut PyObject {
+    let bytes = value.to_be_bytes();
+    let little_endian_bytes = [
+        bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8],
+        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ];
+    unsafe {
+        PyBytes_FromStringAndSize(
+            little_endian_bytes.as_ptr().cast(),
+            little_endian_bytes.len() as Py_ssize_t,
+        )
+    }
+}
+
+unsafe fn small_unsigned_long(value: u128) -> *mut PyObject {
+    unsafe { PyLong_FromUnsignedLongLong(value as c_ulonglong) }
+}
+
+unsafe fn uuid_fields_object(value: u128) -> *mut PyObject {
+    unsafe {
+        let tuple = PyTuple_New(6);
+        if tuple.is_null() {
+            return ptr::null_mut();
+        }
+        let values = [
+            value >> 96,
+            (value >> 80) & 0xffff,
+            (value >> 64) & 0xffff,
+            (value >> 56) & 0xff,
+            (value >> 48) & 0xff,
+            value & 0xffffffffffff,
+        ];
+        for (index, item) in values.iter().enumerate() {
+            let object = small_unsigned_long(*item);
+            if object.is_null() || PyTuple_SetItem(tuple, index as Py_ssize_t, object) < 0 {
+                xdecref(object);
+                Py_DECREF(tuple);
+                return ptr::null_mut();
+            }
+        }
+        tuple
+    }
+}
+
+fn uuid_field_value(value: u128, field: u8) -> u128 {
+    match field {
+        0 => value >> 96,
+        1 => (value >> 80) & 0xffff,
+        2 => (value >> 64) & 0xffff,
+        3 => (value >> 56) & 0xff,
+        4 => (value >> 48) & 0xff,
+        5 => ((value >> 64) & 0x0fff) << 48 | (((value >> 80) & 0xffff) << 32) | (value >> 96),
+        6 => (((value >> 56) & 0x3f) << 8) | ((value >> 48) & 0xff),
+        _ => value & 0xffffffffffff,
+    }
+}
+
+unsafe fn uuid_field_object(value: u128, field: u8) -> *mut PyObject {
+    unsafe { small_unsigned_long(uuid_field_value(value, field)) }
+}
+
+unsafe fn intern_name(name: *const c_char) -> *mut PyObject {
+    unsafe { PyUnicode_InternFromString(name) }
+}
+
+unsafe fn load_attribute_names() -> c_int {
+    unsafe {
+        if !NAME_BYTES.is_null() {
+            return 0;
+        }
+        NAME_INT = intern_name(cstr!("int"));
+        NAME_IS_SAFE = intern_name(cstr!("is_safe"));
+        NAME_BYTES = intern_name(cstr!("bytes"));
+        NAME_BYTES_LE = intern_name(cstr!("bytes_le"));
+        NAME_FIELDS = intern_name(cstr!("fields"));
+        NAME_TIME_LOW = intern_name(cstr!("time_low"));
+        NAME_TIME_MID = intern_name(cstr!("time_mid"));
+        NAME_TIME_HI_VERSION = intern_name(cstr!("time_hi_version"));
+        NAME_CLOCK_SEQ_HI_VARIANT = intern_name(cstr!("clock_seq_hi_variant"));
+        NAME_CLOCK_SEQ_LOW = intern_name(cstr!("clock_seq_low"));
+        NAME_TIME = intern_name(cstr!("time"));
+        NAME_CLOCK_SEQ = intern_name(cstr!("clock_seq"));
+        NAME_NODE = intern_name(cstr!("node"));
+        NAME_HEX = intern_name(cstr!("hex"));
+        NAME_URN = intern_name(cstr!("urn"));
+        NAME_VARIANT = intern_name(cstr!("variant"));
+        NAME_VERSION = intern_name(cstr!("version"));
+        if NAME_INT.is_null()
+            || NAME_IS_SAFE.is_null()
+            || NAME_BYTES.is_null()
+            || NAME_BYTES_LE.is_null()
+            || NAME_FIELDS.is_null()
+            || NAME_TIME_LOW.is_null()
+            || NAME_TIME_MID.is_null()
+            || NAME_TIME_HI_VERSION.is_null()
+            || NAME_CLOCK_SEQ_HI_VARIANT.is_null()
+            || NAME_CLOCK_SEQ_LOW.is_null()
+            || NAME_TIME.is_null()
+            || NAME_CLOCK_SEQ.is_null()
+            || NAME_NODE.is_null()
+            || NAME_HEX.is_null()
+            || NAME_URN.is_null()
+            || NAME_VARIANT.is_null()
+            || NAME_VERSION.is_null()
+        {
+            return -1;
+        }
+        0
     }
 }
 
@@ -208,8 +534,8 @@ unsafe fn sequence_fast_item(object: *mut PyObject, index: Py_ssize_t) -> *mut P
     }
 }
 
-fn apply_version(value: u128, version: u8) -> Option<u128> {
-    if !(1..=5).contains(&version) {
+fn apply_version_with_max(value: u128, version: u8, max_version: u8) -> Option<u128> {
+    if !(1..=max_version).contains(&version) {
         return None;
     }
     let with_variant = (value & !(0xc000u128 << 48)) | (0x8000u128 << 48);
@@ -496,7 +822,7 @@ unsafe extern "C" fn uuid1_vectorcall(
             | (clock_seq_hi_variant << 56)
             | (clock_seq_low << 48)
             | node;
-        let value = apply_version(value, 1).unwrap();
+        let value = apply_version_with_max(value, 1, 8).unwrap();
         allocate_uuid(value, SAFE_UUID_UNKNOWN)
     }
 }
@@ -884,7 +1210,8 @@ unsafe extern "C" fn uuid_init_vectorcall(
             let Ok(version) = u8::try_from(version_value) else {
                 return call_original(callable, args, nargsf, kwnames);
             };
-            let Some(versioned_value) = apply_version(value, version) else {
+            let Some(versioned_value) = apply_version_with_max(value, version, MAX_UUID_VERSION)
+            else {
                 return call_original(callable, args, nargsf, kwnames);
             };
             value = versioned_value;
@@ -926,16 +1253,7 @@ unsafe extern "C" fn uuid_str_vectorcall(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let hex = format!("{value:032x}");
-        let string = format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        );
-        PyUnicode_FromStringAndSize(string.as_ptr().cast(), string.len() as Py_ssize_t)
+        uuid_string_object(value)
     }
 }
 
@@ -952,8 +1270,7 @@ unsafe extern "C" fn uuid_hex_vectorcall(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let string = format!("{value:032x}");
-        PyUnicode_FromStringAndSize(string.as_ptr().cast(), string.len() as Py_ssize_t)
+        uuid_hex_object(value)
     }
 }
 
@@ -1027,6 +1344,182 @@ unsafe extern "C" fn uuid_hash_method_vectorcall(
             return ptr::null_mut();
         }
         PyLong_FromSsize_t(hash)
+    }
+}
+
+unsafe fn uuid_get_value_for_getset(object: *mut PyObject) -> Option<u128> {
+    unsafe { uuid_int(object) }
+}
+
+unsafe extern "C" fn uuid_bytes_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object).map_or(ptr::null_mut(), |value| uuid_bytes_object(value))
+    }
+}
+
+unsafe extern "C" fn uuid_bytes_le_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_bytes_le_object(value))
+    }
+}
+
+unsafe extern "C" fn uuid_fields_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object).map_or(ptr::null_mut(), |value| uuid_fields_object(value))
+    }
+}
+
+unsafe extern "C" fn uuid_time_low_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 0))
+    }
+}
+
+unsafe extern "C" fn uuid_time_mid_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 1))
+    }
+}
+
+unsafe extern "C" fn uuid_time_hi_version_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 2))
+    }
+}
+
+unsafe extern "C" fn uuid_clock_seq_hi_variant_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 3))
+    }
+}
+
+unsafe extern "C" fn uuid_clock_seq_low_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 4))
+    }
+}
+
+unsafe extern "C" fn uuid_time_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 5))
+    }
+}
+
+unsafe extern "C" fn uuid_clock_seq_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 6))
+    }
+}
+
+unsafe extern "C" fn uuid_node_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object)
+            .map_or(ptr::null_mut(), |value| uuid_field_object(value, 7))
+    }
+}
+
+unsafe extern "C" fn uuid_hex_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        uuid_get_value_for_getset(object).map_or(ptr::null_mut(), |value| uuid_hex_object(value))
+    }
+}
+
+unsafe extern "C" fn uuid_urn_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        let Some(value) = uuid_get_value_for_getset(object) else {
+            return ptr::null_mut();
+        };
+        let uuid_string = uuid_string_object(value);
+        if uuid_string.is_null() {
+            return ptr::null_mut();
+        }
+        let result = PyUnicode_FromFormat(cstr!("urn:uuid:%U"), uuid_string);
+        Py_DECREF(uuid_string);
+        result
+    }
+}
+
+unsafe extern "C" fn uuid_variant_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        let Some(value) = uuid_get_value_for_getset(object) else {
+            return ptr::null_mut();
+        };
+        let result = if value & (0x8000u128 << 48) == 0 {
+            RESERVED_NCS_VALUE
+        } else if value & (0x4000u128 << 48) == 0 {
+            RFC_4122_VALUE
+        } else if value & (0x2000u128 << 48) == 0 {
+            RESERVED_MICROSOFT_VALUE
+        } else {
+            RESERVED_FUTURE_VALUE
+        };
+        incref(result)
+    }
+}
+
+unsafe extern "C" fn uuid_version_getter(
+    object: *mut PyObject,
+    _closure: *mut c_void,
+) -> *mut PyObject {
+    unsafe {
+        let Some(value) = uuid_get_value_for_getset(object) else {
+            return ptr::null_mut();
+        };
+        if value & (0x8000u128 << 48) != 0 && value & (0x4000u128 << 48) == 0 {
+            small_unsigned_long((value >> 76) & 0xf)
+        } else {
+            none()
+        }
     }
 }
 
@@ -1152,8 +1645,7 @@ unsafe extern "C" fn uuid_bytes_vectorcall(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let bytes = value.to_be_bytes();
-        PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t)
+        uuid_bytes_object(value)
     }
 }
 
@@ -1170,25 +1662,7 @@ unsafe extern "C" fn uuid_bytes_le_vectorcall(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let mut bytes = value.to_be_bytes();
-        bytes[0..4].reverse();
-        bytes[4..6].reverse();
-        bytes[6..8].reverse();
-        PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t)
-    }
-}
-
-unsafe fn pylong_from_u128_lossless(value: u128) -> *mut PyObject {
-    unsafe { u128_to_pylong(value) }
-}
-
-unsafe fn tuple_set_u128(tuple: *mut PyObject, index: Py_ssize_t, value: u128) -> c_int {
-    unsafe {
-        let object = pylong_from_u128_lossless(value);
-        if object.is_null() {
-            return -1;
-        }
-        PyTuple_SetItem(tuple, index, object)
+        uuid_bytes_le_object(value)
     }
 }
 
@@ -1205,25 +1679,7 @@ unsafe extern "C" fn uuid_fields_vectorcall(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let tuple = PyTuple_New(6);
-        if tuple.is_null() {
-            return ptr::null_mut();
-        }
-        let values = [
-            value >> 96,
-            (value >> 80) & 0xffff,
-            (value >> 64) & 0xffff,
-            (value >> 56) & 0xff,
-            (value >> 48) & 0xff,
-            value & 0xffffffffffff,
-        ];
-        for (index, item) in values.iter().enumerate() {
-            if tuple_set_u128(tuple, index as Py_ssize_t, *item) < 0 {
-                Py_DECREF(tuple);
-                return ptr::null_mut();
-            }
-        }
-        tuple
+        uuid_fields_object(value)
     }
 }
 
@@ -1240,17 +1696,7 @@ unsafe extern "C" fn uuid_field_value_vectorcall<const FIELD: u8>(
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let field_value = match FIELD {
-            0 => value >> 96,
-            1 => (value >> 80) & 0xffff,
-            2 => (value >> 64) & 0xffff,
-            3 => (value >> 56) & 0xff,
-            4 => (value >> 48) & 0xff,
-            5 => ((value >> 64) & 0x0fff) << 48 | (((value >> 80) & 0xffff) << 32) | (value >> 96),
-            6 => (((value >> 56) & 0x3f) << 8) | ((value >> 48) & 0xff),
-            _ => value & 0xffffffffffff,
-        };
-        pylong_from_u128_lossless(field_value)
+        uuid_field_object(value, FIELD)
     }
 }
 
@@ -1561,6 +2007,167 @@ unsafe fn restore_uuid_property(name: *const c_char) -> c_int {
     }
 }
 
+unsafe fn initialize_uuid_getset_defs() {
+    unsafe {
+        if !UUID_GETSET_DEFS[0].name.is_null() {
+            return;
+        }
+        UUID_GETSET_DEFS[0] = PyGetSetDef {
+            name: cstr!("bytes"),
+            get: Some(uuid_bytes_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[1] = PyGetSetDef {
+            name: cstr!("bytes_le"),
+            get: Some(uuid_bytes_le_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[2] = PyGetSetDef {
+            name: cstr!("fields"),
+            get: Some(uuid_fields_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[3] = PyGetSetDef {
+            name: cstr!("time_low"),
+            get: Some(uuid_time_low_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[4] = PyGetSetDef {
+            name: cstr!("time_mid"),
+            get: Some(uuid_time_mid_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[5] = PyGetSetDef {
+            name: cstr!("time_hi_version"),
+            get: Some(uuid_time_hi_version_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[6] = PyGetSetDef {
+            name: cstr!("clock_seq_hi_variant"),
+            get: Some(uuid_clock_seq_hi_variant_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[7] = PyGetSetDef {
+            name: cstr!("clock_seq_low"),
+            get: Some(uuid_clock_seq_low_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[8] = PyGetSetDef {
+            name: cstr!("time"),
+            get: Some(uuid_time_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[9] = PyGetSetDef {
+            name: cstr!("clock_seq"),
+            get: Some(uuid_clock_seq_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[10] = PyGetSetDef {
+            name: cstr!("node"),
+            get: Some(uuid_node_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[11] = PyGetSetDef {
+            name: cstr!("hex"),
+            get: Some(uuid_hex_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[12] = PyGetSetDef {
+            name: cstr!("urn"),
+            get: Some(uuid_urn_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[13] = PyGetSetDef {
+            name: cstr!("variant"),
+            get: Some(uuid_variant_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[14] = PyGetSetDef {
+            name: cstr!("version"),
+            get: Some(uuid_version_getter),
+            set: None,
+            doc: ptr::null(),
+            closure: ptr::null_mut(),
+        };
+        UUID_GETSET_DEFS[15] = EMPTY_GETSET_DEF;
+    }
+}
+
+unsafe fn patch_uuid_getset_descriptors() -> c_int {
+    unsafe {
+        initialize_uuid_getset_defs();
+        let uuid_type = UUID_TYPE.cast::<PyTypeObject>();
+        for index in 0..UUID_GETSET_COUNT {
+            if ORIGINAL_UUID_PROPERTIES[index].is_null() {
+                let name = UUID_GETSET_DEFS[index].name;
+                let original = attribute(UUID_TYPE, name);
+                if original.is_null() {
+                    return -1;
+                }
+                ORIGINAL_UUID_PROPERTIES[index] = original;
+                let descriptor =
+                    PyDescr_NewGetSet(uuid_type, ptr::addr_of_mut!(UUID_GETSET_DEFS[index]));
+                if descriptor.is_null() {
+                    return -1;
+                }
+                if PyObject_SetAttrString(UUID_TYPE, name, descriptor) < 0 {
+                    Py_DECREF(descriptor);
+                    return -1;
+                }
+                Py_DECREF(descriptor);
+            }
+        }
+        PyType_Modified(uuid_type);
+        0
+    }
+}
+
+unsafe fn restore_uuid_getset_descriptors() -> c_int {
+    unsafe {
+        for index in 0..UUID_GETSET_COUNT {
+            let original = ORIGINAL_UUID_PROPERTIES[index];
+            if !original.is_null() {
+                let name = UUID_GETSET_DEFS[index].name;
+                if PyObject_SetAttrString(UUID_TYPE, name, original) < 0 {
+                    return -1;
+                }
+                Py_DECREF(original);
+                ORIGINAL_UUID_PROPERTIES[index] = ptr::null_mut();
+            }
+        }
+        PyType_Modified(UUID_TYPE.cast::<PyTypeObject>());
+        0
+    }
+}
+
 unsafe fn member_descriptor_offset(descriptor: *mut PyObject) -> Option<Py_ssize_t> {
     unsafe {
         if descriptor.is_null() {
@@ -1596,6 +2203,7 @@ unsafe fn load_uuid_slot_offsets() -> c_int {
         0
     }
 }
+
 unsafe fn load_uuid_references() -> c_int {
     unsafe {
         if !UUID_MODULE.is_null() {
@@ -1617,6 +2225,14 @@ unsafe fn load_uuid_references() -> c_int {
         RFC_4122_VALUE = attribute(module, cstr!("RFC_4122"));
         RESERVED_MICROSOFT_VALUE = attribute(module, cstr!("RESERVED_MICROSOFT"));
         RESERVED_FUTURE_VALUE = attribute(module, cstr!("RESERVED_FUTURE"));
+        let uuid6_function = attribute(module, cstr!("uuid6"));
+        if uuid6_function.is_null() {
+            PyErr_Clear();
+            MAX_UUID_VERSION = 5;
+        } else {
+            Py_DECREF(uuid6_function);
+            MAX_UUID_VERSION = 8;
+        }
         if UUID_TYPE.is_null()
             || SAFE_UUID_UNKNOWN.is_null()
             || RESERVED_NCS_VALUE.is_null()
@@ -1695,36 +2311,15 @@ unsafe fn apply_all_patches() -> c_int {
         }
         let property_patches = [
             (cstr!("bytes"), uuid_bytes_vectorcall as vectorcallfunc),
-            (
-                cstr!("bytes_le"),
-                uuid_bytes_le_vectorcall as vectorcallfunc,
-            ),
+            (cstr!("bytes_le"), uuid_bytes_le_vectorcall as vectorcallfunc),
             (cstr!("fields"), uuid_fields_vectorcall as vectorcallfunc),
-            (
-                cstr!("time_low"),
-                uuid_time_low_vectorcall as vectorcallfunc,
-            ),
-            (
-                cstr!("time_mid"),
-                uuid_time_mid_vectorcall as vectorcallfunc,
-            ),
-            (
-                cstr!("time_hi_version"),
-                uuid_time_hi_version_vectorcall as vectorcallfunc,
-            ),
-            (
-                cstr!("clock_seq_hi_variant"),
-                uuid_clock_seq_hi_variant_vectorcall as vectorcallfunc,
-            ),
-            (
-                cstr!("clock_seq_low"),
-                uuid_clock_seq_low_vectorcall as vectorcallfunc,
-            ),
+            (cstr!("time_low"), uuid_time_low_vectorcall as vectorcallfunc),
+            (cstr!("time_mid"), uuid_time_mid_vectorcall as vectorcallfunc),
+            (cstr!("time_hi_version"), uuid_time_hi_version_vectorcall as vectorcallfunc),
+            (cstr!("clock_seq_hi_variant"), uuid_clock_seq_hi_variant_vectorcall as vectorcallfunc),
+            (cstr!("clock_seq_low"), uuid_clock_seq_low_vectorcall as vectorcallfunc),
             (cstr!("time"), uuid_time_vectorcall as vectorcallfunc),
-            (
-                cstr!("clock_seq"),
-                uuid_clock_seq_vectorcall as vectorcallfunc,
-            ),
+            (cstr!("clock_seq"), uuid_clock_seq_vectorcall as vectorcallfunc),
             (cstr!("node"), uuid_node_vectorcall as vectorcallfunc),
             (cstr!("hex"), uuid_hex_vectorcall as vectorcallfunc),
             (cstr!("urn"), uuid_urn_vectorcall as vectorcallfunc),
@@ -1736,7 +2331,6 @@ unsafe fn apply_all_patches() -> c_int {
                 return -1;
             }
         }
-        PyType_Modified(UUID_TYPE.cast::<PyTypeObject>());
         0
     }
 }
@@ -1798,7 +2392,6 @@ unsafe fn restore_all_patches() -> c_int {
                 return -1;
             }
         }
-        PyType_Modified(UUID_TYPE.cast::<PyTypeObject>());
         0
     }
 }
@@ -1859,11 +2452,11 @@ unsafe extern "C" fn py_disable(_self: *mut PyObject, _args: *mut PyObject) -> *
     }
 }
 
-unsafe extern "C" fn py_is_enabled(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn py_enabled(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe { PyBool_FromLong(PATCHED.load(Ordering::SeqCst) as c_long) }
 }
 
-static mut METHODS: [PyMethodDef; 8] = [PyMethodDef::zeroed(); 8];
+static mut METHODS: [PyMethodDef; 9] = [PyMethodDef::zeroed(); 9];
 
 unsafe fn init_methods() {
     unsafe {
@@ -1900,9 +2493,9 @@ unsafe fn init_methods() {
             ml_doc: cstr!("Disable uuid vectorcall patches."),
         };
         METHODS[4] = PyMethodDef {
-            ml_name: cstr!("is_enabled"),
+            ml_name: cstr!("enabled"),
             ml_meth: PyMethodDefPointer {
-                PyCFunction: py_is_enabled,
+                PyCFunction: py_enabled,
             },
             ml_flags: METH_NOARGS,
             ml_doc: cstr!("Return whether uuid vectorcall patches are enabled."),
@@ -1923,7 +2516,7 @@ unsafe fn init_methods() {
             ml_flags: METH_FASTCALL | METH_KEYWORDS,
             ml_doc: cstr!("Generate a version 7 UUID."),
         };
-        METHODS[7] = PyMethodDef::zeroed();
+        METHODS[8] = PyMethodDef::zeroed();
     }
 }
 
