@@ -1,7 +1,5 @@
 #![allow(non_snake_case)]
 
-#[cfg(not(Py_3_13))]
-use core::ffi::c_uchar;
 use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
 use pyo3_ffi::*;
 use std::ptr;
@@ -9,10 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 
 const CAPSULE_NAME: *const c_char = c"uuideal._original_vectorcall".as_ptr();
-#[cfg(Py_3_13)]
-const PY_ASNATIVEBYTES_BIG_ENDIAN: c_int = 0;
-#[cfg(Py_3_13)]
-const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
 
 static PATCHED: AtomicBool = AtomicBool::new(false);
 
@@ -68,35 +62,7 @@ struct PyASCIIObjectLayout {
 extern "C" {
     fn PyFunction_SetVectorcall(callable: *mut PyObject, vectorcall: vectorcallfunc);
     fn PyVectorcall_Function(callable: *mut PyObject) -> Option<vectorcallfunc>;
-    #[cfg(Py_3_13)]
-    fn PyLong_FromUnsignedNativeBytes(
-        buffer: *const c_void,
-        n_bytes: usize,
-        flags: c_int,
-    ) -> *mut PyObject;
-    #[cfg(Py_3_13)]
-    fn PyLong_AsNativeBytes(
-        value: *mut PyObject,
-        buffer: *mut c_void,
-        n_bytes: Py_ssize_t,
-        flags: c_int,
-    ) -> Py_ssize_t;
-    #[cfg(not(Py_3_13))]
-    fn _PyLong_FromByteArray(
-        bytes: *const c_uchar,
-        n: usize,
-        little_endian: c_int,
-        is_signed: c_int,
-    ) -> *mut PyObject;
-    #[cfg(not(Py_3_13))]
-    fn _PyLong_AsByteArray(
-        value: *mut PyLongObject,
-        bytes: *mut c_uchar,
-        n: usize,
-        little_endian: c_int,
-        is_signed: c_int,
-        with_exceptions: c_int,
-    ) -> c_int;
+    fn _PyLong_New(size: Py_ssize_t) -> *mut PyLongObject;
     fn PyUnicode_New(size: Py_ssize_t, maxchar: u32) -> *mut PyObject;
 }
 
@@ -176,26 +142,8 @@ unsafe fn set_uuid_slots_from_pylong(
     }
 }
 
-#[cfg(Py_3_13)]
-unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
-    let bytes = value.to_be_bytes();
-    unsafe {
-        PyLong_FromUnsignedNativeBytes(
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            PY_ASNATIVEBYTES_BIG_ENDIAN,
-        )
-    }
-}
-
-#[cfg(not(Py_3_13))]
-unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
-    let bytes = value.to_be_bytes();
-    unsafe { _PyLong_FromByteArray(bytes.as_ptr(), bytes.len(), 0, 0) }
-}
-
-
 const PYLONG_SHIFT: u32 = 30;
+const PYLONG_MASK: u128 = (1u128 << PYLONG_SHIFT) - 1;
 
 #[repr(C)]
 struct PyLongInternals {
@@ -206,6 +154,50 @@ struct PyLongInternals {
     #[cfg(Py_3_12)]
     lv_tag: usize,
     ob_digit: [u32; 0],
+}
+
+unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
+    unsafe {
+        let ndigits = if value == 0 {
+            0
+        } else if value < (1u128 << PYLONG_SHIFT) {
+            1
+        } else if value < (1u128 << (PYLONG_SHIFT * 2)) {
+            2
+        } else if value < (1u128 << (PYLONG_SHIFT * 3)) {
+            3
+        } else if value < (1u128 << (PYLONG_SHIFT * 4)) {
+            4
+        } else {
+            5
+        };
+
+        let object = _PyLong_New(ndigits as Py_ssize_t);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+
+        let long = object.cast::<PyLongInternals>();
+
+        #[cfg(not(Py_3_12))]
+        {
+            (*long).ob_size = ndigits as Py_ssize_t;
+        }
+
+        #[cfg(Py_3_12)]
+        {
+            (*long).lv_tag = if ndigits == 0 { 1 } else { ndigits << 3 };
+        }
+
+        let digits = (*long).ob_digit.as_mut_ptr();
+        let mut remaining = value;
+        for index in 0..ndigits {
+            *digits.add(index) = (remaining & PYLONG_MASK) as u32;
+            remaining >>= PYLONG_SHIFT;
+        }
+
+        object.cast::<PyObject>()
+    }
 }
 
 unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
