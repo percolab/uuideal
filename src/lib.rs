@@ -7,11 +7,6 @@ use pyo3_ffi::*;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-macro_rules! cstr {
-    ($value:literal) => {
-        concat!($value, "\0").as_ptr().cast::<c_char>()
-    };
-}
 
 const CAPSULE_NAME: *const c_char = c"uuideal._original_vectorcall".as_ptr();
 #[cfg(Py_3_13)]
@@ -132,14 +127,6 @@ unsafe fn attribute(object: *mut PyObject, name: *const c_char) -> *mut PyObject
     unsafe { PyObject_GetAttrString(object, name) }
 }
 
-unsafe fn set_attribute_interned(
-    object: *mut PyObject,
-    interned_name: *mut PyObject,
-    value: *mut PyObject,
-) -> c_int {
-    unsafe { PyObject_GenericSetAttr(object, interned_name, value) }
-}
-
 unsafe fn set_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *mut PyObject) {
     unsafe {
         let slot = object.cast::<u8>().offset(offset).cast::<*mut PyObject>();
@@ -165,18 +152,10 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
         } else {
             is_safe
         };
-        if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
-            set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
-            Py_DECREF(int_object);
-            set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
-            return 0;
-        }
-        if set_attribute_interned(object, INTERNED_INT, int_object) < 0 {
-            Py_DECREF(int_object);
-            return -1;
-        }
+        set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
         Py_DECREF(int_object);
-        set_attribute_interned(object, INTERNED_IS_SAFE, safety_value)
+        set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+        0
     }
 }
 
@@ -191,15 +170,9 @@ unsafe fn set_uuid_slots_from_pylong(
         } else {
             is_safe
         };
-        if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
-            set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
-            set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
-            return 0;
-        }
-        if set_attribute_interned(object, INTERNED_INT, int_object) < 0 {
-            return -1;
-        }
-        set_attribute_interned(object, INTERNED_IS_SAFE, safety_value)
+        set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
+        set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+        0
     }
 }
 
@@ -276,9 +249,6 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
 
 unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
     unsafe {
-        if INT_SLOT_OFFSET < 0 {
-            return None;
-        }
         let int_object = slot_object(object, INT_SLOT_OFFSET);
         if int_object.is_null() {
             return None;
@@ -288,18 +258,7 @@ unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
 }
 
 unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
-    unsafe {
-        if let Some(value) = uuid_int_from_slot(object) {
-            return Some(value);
-        }
-        let int_object = attribute(object, c"int".as_ptr());
-        if int_object.is_null() {
-            return None;
-        }
-        let value = pylong_to_u128(int_object);
-        Py_DECREF(int_object);
-        value
-    }
+    unsafe { uuid_int_from_slot(object) }
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -1161,12 +1120,12 @@ unsafe extern "C" fn uuid_int_method_vectorcall(
         let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
             return ptr::null_mut();
         };
-        let int_object = attribute(self_object, c"int".as_ptr());
+        let int_object = slot_object(self_object, INT_SLOT_OFFSET);
         if int_object.is_null() {
-            call_original(callable, args, nargsf, kwnames)
-        } else {
-            int_object
+            PyErr_SetString(PyExc_RuntimeError, c"uuideal: UUID int slot is null".as_ptr());
+            return ptr::null_mut();
         }
+        incref(int_object)
     }
 }
 
@@ -1180,27 +1139,12 @@ unsafe extern "C" fn uuid_hash_method_vectorcall(
         let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
             return ptr::null_mut();
         };
-        let int_object = if INT_SLOT_OFFSET >= 0 {
-            slot_object(self_object, INT_SLOT_OFFSET)
-        } else {
-            ptr::null_mut()
-        };
-        let owned_int_object = if int_object.is_null() {
-            let object = attribute(self_object, c"int".as_ptr());
-            if object.is_null() {
-                return call_original(callable, args, nargsf, kwnames);
-            }
-            object
-        } else {
-            ptr::null_mut()
-        };
-        let hash_target = if int_object.is_null() {
-            owned_int_object
-        } else {
-            int_object
-        };
-        let hash = PyObject_Hash(hash_target);
-        xdecref(owned_int_object);
+        let int_object = slot_object(self_object, INT_SLOT_OFFSET);
+        if int_object.is_null() {
+            PyErr_SetString(PyExc_RuntimeError, c"uuideal: UUID int slot is null".as_ptr());
+            return ptr::null_mut();
+        }
+        let hash = PyObject_Hash(int_object);
         if hash == -1 && !PyErr_Occurred().is_null() {
             return ptr::null_mut();
         }
@@ -1243,19 +1187,8 @@ unsafe extern "C" fn uuid_from_int_vectorcall(
         if object.is_null() {
             return ptr::null_mut();
         }
-        if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
-            set_slot_by_offset(object, INT_SLOT_OFFSET, value_object);
-            set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, SAFE_UUID_UNKNOWN);
-        } else {
-            if set_attribute_interned(object, INTERNED_INT, value_object) < 0 {
-                Py_DECREF(object);
-                return ptr::null_mut();
-            }
-            if set_attribute_interned(object, INTERNED_IS_SAFE, SAFE_UUID_UNKNOWN) < 0 {
-                Py_DECREF(object);
-                return ptr::null_mut();
-            }
-        }
+        set_slot_by_offset(object, INT_SLOT_OFFSET, value_object);
+        set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, SAFE_UUID_UNKNOWN);
         object
     }
 }
@@ -1585,13 +1518,11 @@ unsafe extern "C" fn uuid_getstate_vectorcall(
         let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
             return ptr::null_mut();
         };
-        if INT_SLOT_OFFSET < 0 || IS_SAFE_SLOT_OFFSET < 0 {
-            return call_original(callable, args, nargsf, kwnames);
-        }
         let int_object = slot_object(self_object, INT_SLOT_OFFSET);
         let is_safe = slot_object(self_object, IS_SAFE_SLOT_OFFSET);
         if int_object.is_null() || is_safe.is_null() {
-            return call_original(callable, args, nargsf, kwnames);
+            PyErr_SetString(PyExc_RuntimeError, c"uuideal: UUID state slots are null".as_ptr());
+            return ptr::null_mut();
         }
         let state = PyDict_New();
         if state.is_null() {
@@ -1628,10 +1559,10 @@ unsafe fn resolve_safe_uuid_borrowed(is_safe_int: *mut PyObject) -> *mut PyObjec
             PyErr_Clear();
             return SAFE_UUID_UNKNOWN;
         }
-        if v == 0 && !SAFE_UUID_SAFE.is_null() {
+        if v == 0 {
             return SAFE_UUID_SAFE;
         }
-        if v == -1 && !SAFE_UUID_UNSAFE.is_null() {
+        if v == -1 {
             return SAFE_UUID_UNSAFE;
         }
         let result = PyObject_CallOneArg(SAFE_UUID_TYPE, is_safe_int);
@@ -1650,9 +1581,6 @@ unsafe extern "C" fn uuid_setstate_vectorcall(
 ) -> *mut PyObject {
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 2 || keyword_count(kwnames) != 0 {
-            return call_original(callable, args, nargsf, kwnames);
-        }
-        if INT_SLOT_OFFSET < 0 || IS_SAFE_SLOT_OFFSET < 0 {
             return call_original(callable, args, nargsf, kwnames);
         }
         let self_object = *args;
@@ -1910,7 +1838,7 @@ unsafe fn load_uuid_slot_offsets() -> c_int {
         let (Some(int_offset), Some(is_safe_offset)) = (int_offset, is_safe_offset) else {
             PyErr_SetString(
                 PyExc_RuntimeError,
-                c"uuideal: unable to resolve UUID slot offsets".as_ptr(),
+                c"uuideal: unable to resolve required UUID int/is_safe slot offsets".as_ptr(),
             );
             return -1;
         };
@@ -1936,15 +1864,15 @@ unsafe fn load_uuid_references() -> c_int {
             return -1;
         }
         SAFE_UUID_UNKNOWN = attribute(SAFE_UUID_TYPE, c"unknown".as_ptr());
+        SAFE_UUID_SAFE = attribute(SAFE_UUID_TYPE, c"safe".as_ptr());
+        SAFE_UUID_UNSAFE = attribute(SAFE_UUID_TYPE, c"unsafe".as_ptr());
+        if SAFE_UUID_UNKNOWN.is_null() || SAFE_UUID_SAFE.is_null() || SAFE_UUID_UNSAFE.is_null() {
+            return -1;
+        }
         RESERVED_NCS_VALUE = attribute(module, c"RESERVED_NCS".as_ptr());
         RFC_4122_VALUE = attribute(module, c"RFC_4122".as_ptr());
         RESERVED_MICROSOFT_VALUE = attribute(module, c"RESERVED_MICROSOFT".as_ptr());
         RESERVED_FUTURE_VALUE = attribute(module, c"RESERVED_FUTURE".as_ptr());
-        SAFE_UUID_SAFE = attribute(SAFE_UUID_TYPE, c"safe".as_ptr());
-        SAFE_UUID_UNSAFE = attribute(SAFE_UUID_TYPE, c"unsafe".as_ptr());
-        if SAFE_UUID_SAFE.is_null() || SAFE_UUID_UNSAFE.is_null() {
-            return -1;
-        }
         let uuid6_function = attribute(module, c"uuid6".as_ptr());
         if uuid6_function.is_null() {
             PyErr_Clear();
@@ -1955,7 +1883,6 @@ unsafe fn load_uuid_references() -> c_int {
         }
         if UUID_TYPE.is_null()
             || SAFE_UUID_TYPE.is_null()
-            || SAFE_UUID_UNKNOWN.is_null()
             || RESERVED_NCS_VALUE.is_null()
             || RFC_4122_VALUE.is_null()
             || RESERVED_MICROSOFT_VALUE.is_null()
@@ -2097,9 +2024,6 @@ unsafe fn apply_all_patches() -> c_int {
 
 unsafe fn restore_all_patches() -> c_int {
     unsafe {
-        if UUID_MODULE.is_null() {
-            return 0;
-        }
         for name in [
             c"uuid1".as_ptr(),
             c"uuid3".as_ptr(),
@@ -2300,6 +2224,9 @@ pub unsafe extern "C" fn PyInit__uuideal() -> *mut PyObject {
     unsafe {
         init_methods();
         MODULE_DEF.m_methods = ptr::addr_of_mut!(METHODS).cast::<PyMethodDef>();
+        if load_uuid_references() < 0 {
+            return ptr::null_mut();
+        }
         PyModuleDef_Init(ptr::addr_of_mut!(MODULE_DEF))
     }
 }
