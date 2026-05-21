@@ -35,6 +35,8 @@ static mut MAX_UUID_VERSION: u8 = 5;
 static mut INTERNED_INT: *mut PyObject = ptr::null_mut();
 static mut INTERNED_IS_SAFE: *mut PyObject = ptr::null_mut();
 static mut INTERNED_VALUE: *mut PyObject = ptr::null_mut();
+static mut SAFE_UUID_SAFE: *mut PyObject = ptr::null_mut();
+static mut SAFE_UUID_UNSAFE: *mut PyObject = ptr::null_mut();
 
 #[repr(C)]
 struct PyDescrObjectLayout {
@@ -178,6 +180,29 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
     }
 }
 
+unsafe fn set_uuid_slots_from_pylong(
+    object: *mut PyObject,
+    int_object: *mut PyObject,
+    is_safe: *mut PyObject,
+) -> c_int {
+    unsafe {
+        let safety_value = if is_safe.is_null() {
+            SAFE_UUID_UNKNOWN
+        } else {
+            is_safe
+        };
+        if INT_SLOT_OFFSET >= 0 && IS_SAFE_SLOT_OFFSET >= 0 {
+            set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
+            set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+            return 0;
+        }
+        if set_attribute_interned(object, INTERNED_INT, int_object) < 0 {
+            return -1;
+        }
+        set_attribute_interned(object, INTERNED_IS_SAFE, safety_value)
+    }
+}
+
 #[cfg(Py_3_13)]
 unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     let bytes = value.to_be_bytes();
@@ -279,22 +304,6 @@ unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-const HEX_DECODE: [i8; 256] = {
-    let mut t = [-1i8; 256];
-    let mut i = 0u8;
-    while i < 10 {
-        t[(b'0' + i) as usize] = i as i8;
-        i += 1;
-    }
-    i = 0;
-    while i < 6 {
-        t[(b'a' + i) as usize] = (10 + i) as i8;
-        t[(b'A' + i) as usize] = (10 + i) as i8;
-        i += 1;
-    }
-    t
-};
-
 fn write_hex_32(value: u128, output: &mut [u8]) {
     let mut shift = 124u32;
     for byte in output.iter_mut().take(32) {
@@ -343,45 +352,6 @@ unsafe fn uuid_string_object(value: u128) -> *mut PyObject {
     unsafe { py_ascii_from_bytes(&bytes) }
 }
 
-fn parse_uuid_hex_bytes(buf: &[u8]) -> Option<u128> {
-    let mut src = buf;
-    if src.len() >= 9 && src[0] == b'u' && src[1] == b'r' && src[2] == b'n' && src[3] == b':' {
-        src = &src[4..];
-    }
-    if src.len() >= 5
-        && src[0] == b'u'
-        && src[1] == b'u'
-        && src[2] == b'i'
-        && src[3] == b'd'
-        && src[4] == b':'
-    {
-        src = &src[5..];
-    }
-    if src.len() >= 2 && src[0] == b'{' && src[src.len() - 1] == b'}' {
-        src = &src[1..src.len() - 1];
-    }
-    let mut value: u128 = 0;
-    let mut digits: u32 = 0;
-    let mut i = 0;
-    while i < src.len() {
-        let byte = src[i];
-        i += 1;
-        if byte == b'-' {
-            continue;
-        }
-        let nibble = HEX_DECODE[byte as usize];
-        if nibble < 0 {
-            return None;
-        }
-        value = (value << 4) | nibble as u128;
-        digits += 1;
-    }
-    if digits != 32 {
-        return None;
-    }
-    Some(value)
-}
-
 unsafe fn parse_uuid_hex_pyunicode(object: *mut PyObject) -> Option<u128> {
     unsafe {
         if PyUnicode_Check(object) == 0 {
@@ -393,7 +363,12 @@ unsafe fn parse_uuid_hex_pyunicode(object: *mut PyObject) -> Option<u128> {
             PyErr_Clear();
             return None;
         }
-        parse_uuid_hex_bytes(std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize))
+        let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize);
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return None,
+        };
+        uuid::Uuid::parse_str(text).ok().map(|uuid| uuid.as_u128())
     }
 }
 
@@ -481,8 +456,21 @@ fn apply_version_with_max(value: u128, version: u8, max_version: u8) -> Option<u
     if !(1..=max_version).contains(&version) {
         return None;
     }
-    let with_variant = (value & !(0xc000u128 << 48)) | (0x8000u128 << 48);
-    Some((with_variant & !(0xf000u128 << 64)) | ((version as u128) << 76))
+    let version = match version {
+        1 => uuid::Version::Mac,
+        2 => uuid::Version::Dce,
+        3 => uuid::Version::Md5,
+        4 => uuid::Version::Random,
+        5 => uuid::Version::Sha1,
+        6 => uuid::Version::SortMac,
+        7 => uuid::Version::SortRand,
+        8 => uuid::Version::Custom,
+        _ => return None,
+    };
+    let mut builder = uuid::Builder::from_u128(value);
+    builder.set_variant(uuid::Variant::RFC4122);
+    builder.set_version(version);
+    Some(builder.into_uuid().as_u128())
 }
 
 fn node_to_bytes(node: u128) -> [u8; 6] {
@@ -859,14 +847,13 @@ unsafe fn bytes_to_uuid_int(object: *mut PyObject, little_endian: bool) -> Optio
             return None;
         }
         let pointer = PyBytes_AsString(object).cast::<u8>();
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(std::slice::from_raw_parts(pointer, 16));
-        if little_endian {
-            bytes[0..4].reverse();
-            bytes[4..6].reverse();
-            bytes[6..8].reverse();
-        }
-        Some(u128::from_be_bytes(bytes))
+        let bytes = std::slice::from_raw_parts(pointer, 16);
+        let uuid = if little_endian {
+            uuid::Uuid::from_slice_le(bytes)
+        } else {
+            uuid::Uuid::from_slice(bytes)
+        };
+        uuid.ok().map(|uuid| uuid.as_u128())
     }
 }
 
@@ -923,6 +910,36 @@ unsafe extern "C" fn uuid_init_vectorcall(
             return call_original(callable, args, nargsf, kwnames);
         }
         let self_object = *args;
+        let nkw = keyword_count(kwnames);
+
+        if positional_count == 2 && nkw == 0 {
+            if let Some(value) = parse_uuid_hex_pyunicode(*args.add(1)) {
+                if set_uuid_slots(self_object, value, ptr::null_mut()) < 0 {
+                    return ptr::null_mut();
+                }
+                return none();
+            }
+        }
+
+        if positional_count == 1 && nkw == 1 {
+            let kw_value = *args.add(1);
+            if keyword_matches(kwnames, 0, c"hex".as_ptr()) {
+                if let Some(value) = parse_uuid_hex_pyunicode(kw_value) {
+                    if set_uuid_slots(self_object, value, ptr::null_mut()) < 0 {
+                        return ptr::null_mut();
+                    }
+                    return none();
+                }
+            } else if keyword_matches(kwnames, 0, c"int".as_ptr()) {
+                if pylong_to_u128(kw_value).is_some() {
+                    if set_uuid_slots_from_pylong(self_object, kw_value, ptr::null_mut()) < 0 {
+                        return ptr::null_mut();
+                    }
+                    return none();
+                }
+            }
+        }
+
         let mut hex_object = if positional_count >= 2 {
             *args.add(1)
         } else {
@@ -955,7 +972,7 @@ unsafe extern "C" fn uuid_init_vectorcall(
         };
         let mut is_safe_object = SAFE_UUID_UNKNOWN;
 
-        for index in 0..keyword_count(kwnames) {
+        for index in 0..nkw {
             let value = *args.add(positional_count as usize + index as usize);
             let target = if keyword_matches(kwnames, index, c"hex".as_ptr()) {
                 &mut hex_object
@@ -996,6 +1013,8 @@ unsafe extern "C" fn uuid_init_vectorcall(
             return call_original(callable, args, nargsf, kwnames);
         }
 
+        let from_int = int_object != Py_None();
+
         let mut value = if hex_object != Py_None() {
             let Some(value) = parse_uuid_hex_pyunicode(hex_object) else {
                 return call_original(callable, args, nargsf, kwnames);
@@ -1035,10 +1054,17 @@ unsafe extern "C" fn uuid_init_vectorcall(
                 return call_original(callable, args, nargsf, kwnames);
             };
             value = versioned_value;
-        }
-
-        if set_uuid_slots(self_object, value, is_safe_object) < 0 {
-            return ptr::null_mut();
+            if set_uuid_slots(self_object, value, is_safe_object) < 0 {
+                return ptr::null_mut();
+            }
+        } else if from_int {
+            if set_uuid_slots_from_pylong(self_object, int_object, is_safe_object) < 0 {
+                return ptr::null_mut();
+            }
+        } else {
+            if set_uuid_slots(self_object, value, is_safe_object) < 0 {
+                return ptr::null_mut();
+            }
         }
         none()
     }
@@ -1592,6 +1618,30 @@ unsafe extern "C" fn uuid_getstate_vectorcall(
     }
 }
 
+unsafe fn resolve_safe_uuid_borrowed(is_safe_int: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if is_safe_int.is_null() || is_safe_int == Py_None() {
+            return SAFE_UUID_UNKNOWN;
+        }
+        let v = PyLong_AsLong(is_safe_int);
+        if v == -1 && !PyErr_Occurred().is_null() {
+            PyErr_Clear();
+            return SAFE_UUID_UNKNOWN;
+        }
+        if v == 0 && !SAFE_UUID_SAFE.is_null() {
+            return SAFE_UUID_SAFE;
+        }
+        if v == -1 && !SAFE_UUID_UNSAFE.is_null() {
+            return SAFE_UUID_UNSAFE;
+        }
+        let result = PyObject_CallOneArg(SAFE_UUID_TYPE, is_safe_int);
+        if result.is_null() {
+            return SAFE_UUID_UNKNOWN;
+        }
+        result
+    }
+}
+
 unsafe extern "C" fn uuid_setstate_vectorcall(
     callable: *mut PyObject,
     args: *const *mut PyObject,
@@ -1619,18 +1669,14 @@ unsafe extern "C" fn uuid_setstate_vectorcall(
         if !is_safe_value.is_null() {
             PyErr_Clear();
         }
-        let is_safe = if is_safe_value.is_null() {
-            SAFE_UUID_UNKNOWN
-        } else {
-            let object = PyObject_CallOneArg(SAFE_UUID_TYPE, is_safe_value);
-            if object.is_null() {
-                return ptr::null_mut();
-            }
-            object
-        };
+        let is_safe = resolve_safe_uuid_borrowed(is_safe_value);
+        let owned = !is_safe_value.is_null()
+            && is_safe != SAFE_UUID_UNKNOWN
+            && is_safe != SAFE_UUID_SAFE
+            && is_safe != SAFE_UUID_UNSAFE;
         set_slot_by_offset(self_object, INT_SLOT_OFFSET, int_object);
         set_slot_by_offset(self_object, IS_SAFE_SLOT_OFFSET, is_safe);
-        if !is_safe_value.is_null() {
+        if owned {
             Py_DECREF(is_safe);
         }
         none()
@@ -1894,6 +1940,11 @@ unsafe fn load_uuid_references() -> c_int {
         RFC_4122_VALUE = attribute(module, c"RFC_4122".as_ptr());
         RESERVED_MICROSOFT_VALUE = attribute(module, c"RESERVED_MICROSOFT".as_ptr());
         RESERVED_FUTURE_VALUE = attribute(module, c"RESERVED_FUTURE".as_ptr());
+        SAFE_UUID_SAFE = attribute(SAFE_UUID_TYPE, c"safe".as_ptr());
+        SAFE_UUID_UNSAFE = attribute(SAFE_UUID_TYPE, c"unsafe".as_ptr());
+        if SAFE_UUID_SAFE.is_null() || SAFE_UUID_UNSAFE.is_null() {
+            return -1;
+        }
         let uuid6_function = attribute(module, c"uuid6".as_ptr());
         if uuid6_function.is_null() {
             PyErr_Clear();
