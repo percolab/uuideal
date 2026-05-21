@@ -232,18 +232,32 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
             tag >> 3
         };
 
-        if ndigits > 5 {
-            return None;
-        }
-
         let digits = (*long).ob_digit.as_ptr();
-        let mut value: u128 = 0;
-        let mut i = ndigits;
-        while i > 0 {
-            i -= 1;
-            value = (value << PYLONG_SHIFT) | (*digits.add(i) as u128);
-        }
-        Some(value)
+        Some(match ndigits {
+            0 => 0,
+            1 => *digits as u128,
+            2 => (*digits.add(1) as u128) << PYLONG_SHIFT
+                | *digits as u128,
+            3 => (*digits.add(2) as u128) << (PYLONG_SHIFT * 2)
+                | (*digits.add(1) as u128) << PYLONG_SHIFT
+                | *digits as u128,
+            4 => (*digits.add(3) as u128) << (PYLONG_SHIFT * 3)
+                | (*digits.add(2) as u128) << (PYLONG_SHIFT * 2)
+                | (*digits.add(1) as u128) << PYLONG_SHIFT
+                | *digits as u128,
+            5 => {
+                let high = *digits.add(4);
+                if high > 0xff {
+                    return None;
+                }
+                (high as u128) << (PYLONG_SHIFT * 4)
+                    | (*digits.add(3) as u128) << (PYLONG_SHIFT * 3)
+                    | (*digits.add(2) as u128) << (PYLONG_SHIFT * 2)
+                    | (*digits.add(1) as u128) << PYLONG_SHIFT
+                    | *digits as u128
+            }
+            _ => return None,
+        })
     }
 }
 
