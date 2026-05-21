@@ -32,6 +32,9 @@ static mut RESERVED_FUTURE_VALUE: *mut PyObject = ptr::null_mut();
 static mut INT_SLOT_OFFSET: Py_ssize_t = -1;
 static mut IS_SAFE_SLOT_OFFSET: Py_ssize_t = -1;
 static mut MAX_UUID_VERSION: u8 = 5;
+static mut INTERNED_INT: *mut PyObject = ptr::null_mut();
+static mut INTERNED_IS_SAFE: *mut PyObject = ptr::null_mut();
+static mut INTERNED_VALUE: *mut PyObject = ptr::null_mut();
 
 #[repr(C)]
 struct PyDescrObjectLayout {
@@ -127,20 +130,12 @@ unsafe fn attribute(object: *mut PyObject, name: *const c_char) -> *mut PyObject
     unsafe { PyObject_GetAttrString(object, name) }
 }
 
-unsafe fn generic_set_attribute(
+unsafe fn set_attribute_interned(
     object: *mut PyObject,
-    name: *const c_char,
+    interned_name: *mut PyObject,
     value: *mut PyObject,
 ) -> c_int {
-    unsafe {
-        let py_name = PyUnicode_FromString(name);
-        if py_name.is_null() {
-            return -1;
-        }
-        let result = PyObject_GenericSetAttr(object, py_name, value);
-        Py_DECREF(py_name);
-        result
-    }
+    unsafe { PyObject_GenericSetAttr(object, interned_name, value) }
 }
 
 unsafe fn set_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *mut PyObject) {
@@ -174,12 +169,12 @@ unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObj
             set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
             return 0;
         }
-        if generic_set_attribute(object, c"int".as_ptr(), int_object) < 0 {
+        if set_attribute_interned(object, INTERNED_INT, int_object) < 0 {
             Py_DECREF(int_object);
             return -1;
         }
         Py_DECREF(int_object);
-        generic_set_attribute(object, c"is_safe".as_ptr(), safety_value)
+        set_attribute_interned(object, INTERNED_IS_SAFE, safety_value)
     }
 }
 
@@ -201,44 +196,6 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     unsafe { _PyLong_FromByteArray(bytes.as_ptr(), bytes.len(), 0, 0) }
 }
 
-#[cfg(Py_3_13)]
-unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
-    let mut bytes = [0u8; 16];
-    let flags = PY_ASNATIVEBYTES_BIG_ENDIAN | PY_ASNATIVEBYTES_REJECT_NEGATIVE;
-    let written = unsafe {
-        PyLong_AsNativeBytes(
-            object,
-            bytes.as_mut_ptr().cast(),
-            bytes.len() as Py_ssize_t,
-            flags,
-        )
-    };
-    if written < 0 || written > bytes.len() as Py_ssize_t {
-        unsafe { PyErr_Clear() };
-        return None;
-    }
-    Some(u128::from_be_bytes(bytes))
-}
-
-#[cfg(not(Py_3_13))]
-unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
-    let mut bytes = [0u8; 16];
-    let result = unsafe {
-        _PyLong_AsByteArray(
-            object.cast::<PyLongObject>(),
-            bytes.as_mut_ptr(),
-            bytes.len(),
-            0,
-            0,
-            1,
-        )
-    };
-    if result < 0 {
-        unsafe { PyErr_Clear() };
-        return None;
-    }
-    Some(u128::from_be_bytes(bytes))
-}
 
 const PYLONG_SHIFT: u32 = 30;
 
@@ -253,7 +210,7 @@ struct PyLongInternals {
     ob_digit: [u32; 0],
 }
 
-unsafe fn pylong_to_u128_fast(object: *mut PyObject) -> Option<u128> {
+unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     unsafe {
         let long = object.cast::<PyLongInternals>();
 
@@ -301,7 +258,7 @@ unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
         if int_object.is_null() {
             return None;
         }
-        pylong_to_u128_fast(int_object)
+        pylong_to_u128(int_object)
     }
 }
 
@@ -321,6 +278,22 @@ unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+const HEX_DECODE: [i8; 256] = {
+    let mut t = [-1i8; 256];
+    let mut i = 0u8;
+    while i < 10 {
+        t[(b'0' + i) as usize] = i as i8;
+        i += 1;
+    }
+    i = 0;
+    while i < 6 {
+        t[(b'a' + i) as usize] = (10 + i) as i8;
+        t[(b'A' + i) as usize] = (10 + i) as i8;
+        i += 1;
+    }
+    t
+};
 
 fn write_hex_32(value: u128, output: &mut [u8]) {
     let mut shift = 124u32;
@@ -368,6 +341,60 @@ unsafe fn uuid_string_object(value: u128) -> *mut PyObject {
     let mut bytes = [0u8; 36];
     write_uuid_string(value, &mut bytes);
     unsafe { py_ascii_from_bytes(&bytes) }
+}
+
+fn parse_uuid_hex_bytes(buf: &[u8]) -> Option<u128> {
+    let mut src = buf;
+    if src.len() >= 9 && src[0] == b'u' && src[1] == b'r' && src[2] == b'n' && src[3] == b':' {
+        src = &src[4..];
+    }
+    if src.len() >= 5
+        && src[0] == b'u'
+        && src[1] == b'u'
+        && src[2] == b'i'
+        && src[3] == b'd'
+        && src[4] == b':'
+    {
+        src = &src[5..];
+    }
+    if src.len() >= 2 && src[0] == b'{' && src[src.len() - 1] == b'}' {
+        src = &src[1..src.len() - 1];
+    }
+    let mut value: u128 = 0;
+    let mut digits: u32 = 0;
+    let mut i = 0;
+    while i < src.len() {
+        let byte = src[i];
+        i += 1;
+        if byte == b'-' {
+            continue;
+        }
+        let nibble = HEX_DECODE[byte as usize];
+        if nibble < 0 {
+            return None;
+        }
+        value = (value << 4) | nibble as u128;
+        digits += 1;
+    }
+    if digits != 32 {
+        return None;
+    }
+    Some(value)
+}
+
+unsafe fn parse_uuid_hex_pyunicode(object: *mut PyObject) -> Option<u128> {
+    unsafe {
+        if PyUnicode_Check(object) == 0 {
+            return None;
+        }
+        let mut size: Py_ssize_t = 0;
+        let ptr = PyUnicode_AsUTF8AndSize(object, &mut size);
+        if ptr.is_null() {
+            PyErr_Clear();
+            return None;
+        }
+        parse_uuid_hex_bytes(std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize))
+    }
 }
 
 unsafe fn uuid_bytes_object(value: u128) -> *mut PyObject {
@@ -826,31 +853,6 @@ unsafe extern "C" fn uuid7_vectorcall(
     }
 }
 
-unsafe fn unicode_to_string(object: *mut PyObject) -> Option<String> {
-    unsafe {
-        let utf8 = PyUnicode_AsUTF8AndSize(object, ptr::null_mut());
-        if utf8.is_null() {
-            PyErr_Clear();
-            None
-        } else {
-            Some(
-                std::ffi::CStr::from_ptr(utf8)
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
-    }
-}
-
-fn parse_hex_string(mut value: String) -> Option<u128> {
-    value = value.replace("urn:", "").replace("uuid:", "");
-    value = value.trim_matches(['{', '}']).replace('-', "");
-    if value.len() != 32 {
-        return None;
-    }
-    u128::from_str_radix(&value, 16).ok()
-}
-
 unsafe fn bytes_to_uuid_int(object: *mut PyObject, little_endian: bool) -> Option<u128> {
     unsafe {
         if PyBytes_Check(object) == 0 || PyBytes_Size(object) != 16 {
@@ -995,10 +997,7 @@ unsafe extern "C" fn uuid_init_vectorcall(
         }
 
         let mut value = if hex_object != Py_None() {
-            let Some(string) = unicode_to_string(hex_object) else {
-                return call_original(callable, args, nargsf, kwnames);
-            };
-            let Some(value) = parse_hex_string(string) else {
+            let Some(value) = parse_uuid_hex_pyunicode(hex_object) else {
                 return call_original(callable, args, nargsf, kwnames);
             };
             value
@@ -1222,11 +1221,11 @@ unsafe extern "C" fn uuid_from_int_vectorcall(
             set_slot_by_offset(object, INT_SLOT_OFFSET, value_object);
             set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, SAFE_UUID_UNKNOWN);
         } else {
-            if generic_set_attribute(object, c"int".as_ptr(), value_object) < 0 {
+            if set_attribute_interned(object, INTERNED_INT, value_object) < 0 {
                 Py_DECREF(object);
                 return ptr::null_mut();
             }
-            if generic_set_attribute(object, c"is_safe".as_ptr(), SAFE_UUID_UNKNOWN) < 0 {
+            if set_attribute_interned(object, INTERNED_IS_SAFE, SAFE_UUID_UNKNOWN) < 0 {
                 Py_DECREF(object);
                 return ptr::null_mut();
             }
@@ -1477,6 +1476,15 @@ unsafe extern "C" fn uuid_node_vectorcall(
     unsafe { uuid_field_value_vectorcall::<7>(callable, args, nargsf, kwnames) }
 }
 
+unsafe fn uuid_urn_bytes(value: u128) -> *mut PyObject {
+    let mut bytes = [0u8; 45];
+    bytes[0..9].copy_from_slice(b"urn:uuid:");
+    let mut uuid_part = [0u8; 36];
+    write_uuid_string(value, &mut uuid_part);
+    bytes[9..45].copy_from_slice(&uuid_part);
+    unsafe { py_ascii_from_bytes(&bytes) }
+}
+
 unsafe extern "C" fn uuid_urn_vectorcall(
     callable: *mut PyObject,
     args: *const *mut PyObject,
@@ -1484,13 +1492,13 @@ unsafe extern "C" fn uuid_urn_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let string = uuid_str_vectorcall(callable, args, nargsf, kwnames);
-        if string.is_null() {
+        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
             return ptr::null_mut();
-        }
-        let result = PyUnicode_FromFormat(c"urn:uuid:%U".as_ptr(), string);
-        Py_DECREF(string);
-        result
+        };
+        let Some(value) = uuid_int(self_object) else {
+            return call_original(callable, args, nargsf, kwnames);
+        };
+        uuid_urn_bytes(value)
     }
 }
 
@@ -1563,17 +1571,17 @@ unsafe extern "C" fn uuid_getstate_vectorcall(
         if state.is_null() {
             return ptr::null_mut();
         }
-        if PyDict_SetItemString(state, c"int".as_ptr(), int_object) < 0 {
+        if PyDict_SetItem(state, INTERNED_INT, int_object) < 0 {
             Py_DECREF(state);
             return ptr::null_mut();
         }
         if is_safe != SAFE_UUID_UNKNOWN {
-            let is_safe_value = attribute(is_safe, c"value".as_ptr());
+            let is_safe_value = PyObject_GetAttr(is_safe, INTERNED_VALUE);
             if is_safe_value.is_null() {
                 Py_DECREF(state);
                 return ptr::null_mut();
             }
-            let result = PyDict_SetItemString(state, c"is_safe".as_ptr(), is_safe_value);
+            let result = PyDict_SetItem(state, INTERNED_IS_SAFE, is_safe_value);
             Py_DECREF(is_safe_value);
             if result < 0 {
                 Py_DECREF(state);
@@ -1602,11 +1610,15 @@ unsafe extern "C" fn uuid_setstate_vectorcall(
         if PyDict_Check(state) == 0 {
             return call_original(callable, args, nargsf, kwnames);
         }
-        let int_object = PyDict_GetItemString(state, c"int".as_ptr());
+        let int_object = PyDict_GetItem(state, INTERNED_INT);
         if int_object.is_null() {
+            PyErr_Clear();
             return call_original(callable, args, nargsf, kwnames);
         }
-        let is_safe_value = PyDict_GetItemString(state, c"is_safe".as_ptr());
+        let is_safe_value = PyDict_GetItem(state, INTERNED_IS_SAFE);
+        if !is_safe_value.is_null() {
+            PyErr_Clear();
+        }
         let is_safe = if is_safe_value.is_null() {
             SAFE_UUID_UNKNOWN
         } else {
@@ -1899,6 +1911,17 @@ unsafe fn load_uuid_references() -> c_int {
             || RESERVED_FUTURE_VALUE.is_null()
         {
             return -1;
+        }
+        if INTERNED_INT.is_null() {
+            INTERNED_INT = PyUnicode_InternFromString(c"int".as_ptr());
+            INTERNED_IS_SAFE = PyUnicode_InternFromString(c"is_safe".as_ptr());
+            INTERNED_VALUE = PyUnicode_InternFromString(c"value".as_ptr());
+            if INTERNED_INT.is_null()
+                || INTERNED_IS_SAFE.is_null()
+                || INTERNED_VALUE.is_null()
+            {
+                return -1;
+            }
         }
         if load_uuid_slot_offsets() < 0 {
             return -1;
