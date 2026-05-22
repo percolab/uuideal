@@ -3,14 +3,24 @@
 use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
 use pyo3_ffi::*;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 
 const CAPSULE_NAME: *const c_char = c"uuideal._original_vectorcall".as_ptr();
 
+const GETNODE_MODE_TRUSTED: u8 = 0;
+const GETNODE_MODE_UNKNOWN: u8 = 1;
+
 static PATCHED: AtomicBool = AtomicBool::new(false);
+static DEFAULT_NODE_READY: AtomicBool = AtomicBool::new(false);
+static DEFAULT_NODE: AtomicU64 = AtomicU64::new(0);
+static GETNODE_MODE: AtomicU8 = AtomicU8::new(GETNODE_MODE_TRUSTED);
 
 static mut UUID_MODULE: *mut PyObject = ptr::null_mut();
+static mut UUID_DICT: *mut PyObject = ptr::null_mut();
+static mut ORIGINAL_GETNODE: *mut PyObject = ptr::null_mut();
+static mut TRUSTED_GETNODE: *mut PyObject = ptr::null_mut();
+static mut UUID_DICT_WATCHER_ID: c_int = -1;
 static mut UUID_TYPE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_TYPE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_UNKNOWN: *mut PyObject = ptr::null_mut();
@@ -24,8 +34,12 @@ static mut MAX_UUID_VERSION: u8 = 5;
 static mut INTERNED_INT: *mut PyObject = ptr::null_mut();
 static mut INTERNED_IS_SAFE: *mut PyObject = ptr::null_mut();
 static mut INTERNED_VALUE: *mut PyObject = ptr::null_mut();
+static mut INTERNED_NODE: *mut PyObject = ptr::null_mut();
+static mut INTERNED_GETNODE: *mut PyObject = ptr::null_mut();
+static mut INTERNED_GENERATE_TIME_SAFE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_SAFE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_UNSAFE: *mut PyObject = ptr::null_mut();
+static mut GENERATE_TIME_SAFE: *mut PyObject = ptr::null_mut();
 
 #[repr(C)]
 struct PyDescrObjectLayout {
@@ -67,12 +81,19 @@ struct PyBytesObjectLayout {
 
 const PYASCII_STATE_ASCII: u32 = 1 << 6;
 
+type PyDictWatchCallback = Option<
+    unsafe extern "C" fn(c_int, *mut PyObject, *mut PyObject, *mut PyObject) -> c_int,
+>;
+
 #[cfg_attr(windows, link(name = "pythonXY"))]
 extern "C" {
     fn PyFunction_SetVectorcall(callable: *mut PyObject, vectorcall: vectorcallfunc);
     fn PyVectorcall_Function(callable: *mut PyObject) -> Option<vectorcallfunc>;
     fn _PyLong_New(size: Py_ssize_t) -> *mut PyLongObject;
+    fn PyLong_AsUnsignedLongLongMask(object: *mut PyObject) -> c_ulonglong;
     fn PyUnicode_New(size: Py_ssize_t, maxchar: u32) -> *mut PyObject;
+    fn PyDict_AddWatcher(callback: PyDictWatchCallback) -> c_int;
+    fn PyDict_Watch(watcher_id: c_int, dict: *mut PyObject) -> c_int;
 }
 
 unsafe fn incref(object: *mut PyObject) -> *mut PyObject {
@@ -131,6 +152,124 @@ unsafe fn slot_object(object: *mut PyObject, offset: Py_ssize_t) -> *mut PyObjec
 
 unsafe fn slot_pointer(object: *mut PyObject, offset: Py_ssize_t) -> *mut *mut PyObject {
     unsafe { object.cast::<u8>().offset(offset).cast::<*mut PyObject>() }
+}
+
+unsafe fn invalidate_default_node_cache() {
+    DEFAULT_NODE_READY.store(false, Ordering::Relaxed);
+}
+
+unsafe fn clear_trusted_getnode() {
+    unsafe {
+        if !TRUSTED_GETNODE.is_null() {
+            Py_DECREF(TRUSTED_GETNODE);
+            TRUSTED_GETNODE = ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn clear_generate_time_safe() {
+    unsafe {
+        if !GENERATE_TIME_SAFE.is_null() {
+            Py_DECREF(GENERATE_TIME_SAFE);
+            GENERATE_TIME_SAFE = ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn set_generate_time_safe_borrowed(value: *mut PyObject) {
+    unsafe {
+        clear_generate_time_safe();
+        if !value.is_null() && value != Py_None() {
+            Py_INCREF(value);
+            GENERATE_TIME_SAFE = value;
+        }
+    }
+}
+
+unsafe fn trust_getnode_borrowed(getnode: *mut PyObject) {
+    unsafe {
+        if TRUSTED_GETNODE == getnode {
+            return;
+        }
+        clear_trusted_getnode();
+        if !getnode.is_null() {
+            Py_INCREF(getnode);
+            TRUSTED_GETNODE = getnode;
+        }
+    }
+}
+
+unsafe fn watched_key_matches(key: *mut PyObject, watched: *mut PyObject) -> bool {
+    unsafe {
+        if key.is_null() || watched.is_null() {
+            return false;
+        }
+        if key == watched {
+            return true;
+        }
+        PyObject_RichCompareBool(key, watched, Py_EQ) == 1
+    }
+}
+
+unsafe extern "C" fn uuid_dict_watcher(
+    _event: c_int,
+    _dict: *mut PyObject,
+    key: *mut PyObject,
+    new_value: *mut PyObject,
+) -> c_int {
+    unsafe {
+        if key.is_null() {
+            invalidate_default_node_cache();
+            clear_trusted_getnode();
+            GETNODE_MODE.store(GETNODE_MODE_UNKNOWN, Ordering::Relaxed);
+            return 0;
+        }
+
+        if watched_key_matches(key, INTERNED_NODE) {
+            invalidate_default_node_cache();
+            return 0;
+        }
+
+        if watched_key_matches(key, INTERNED_GETNODE) {
+            invalidate_default_node_cache();
+            clear_trusted_getnode();
+
+            if !new_value.is_null() && new_value == ORIGINAL_GETNODE {
+                GETNODE_MODE.store(GETNODE_MODE_TRUSTED, Ordering::Relaxed);
+            } else {
+                GETNODE_MODE.store(GETNODE_MODE_UNKNOWN, Ordering::Relaxed);
+            }
+
+            return 0;
+        }
+
+        if watched_key_matches(key, INTERNED_GENERATE_TIME_SAFE) {
+            set_generate_time_safe_borrowed(new_value);
+            return 0;
+        }
+
+        0
+    }
+}
+
+unsafe fn install_uuid_dict_watcher() -> c_int {
+    unsafe {
+        if UUID_DICT_WATCHER_ID >= 0 {
+            return 0;
+        }
+
+        let watcher_id = PyDict_AddWatcher(Some(uuid_dict_watcher));
+        if watcher_id < 0 {
+            return -1;
+        }
+
+        if PyDict_Watch(watcher_id, UUID_DICT) < 0 {
+            return -1;
+        }
+
+        UUID_DICT_WATCHER_ID = watcher_id;
+        0
+    }
 }
 
 unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObject) -> c_int {
@@ -717,7 +856,7 @@ unsafe fn parse_node_and_clock_seq(
     args: *const *mut PyObject,
     nargsf: usize,
     kwnames: *mut PyObject,
-) -> Option<(*mut PyObject, *mut PyObject)> {
+) -> Option<(*mut PyObject, *mut PyObject, bool, bool)> {
     unsafe {
         let positional_count = PyVectorcall_NARGS(nargsf);
         if positional_count > 2 || keyword_count(kwnames) > 2 {
@@ -734,27 +873,147 @@ unsafe fn parse_node_and_clock_seq(
         } else {
             ptr::null_mut()
         };
+        let mut node_supplied = positional_count >= 1;
+        let mut clock_seq_supplied = positional_count >= 2;
         for index in 0..keyword_count(kwnames) {
             let value = *args.add(positional_count as usize + index as usize);
             if keyword_matches(kwnames, index, c"node".as_ptr()) {
-                if !node_object.is_null() {
+                if node_supplied {
                     call_original(callable, args, nargsf, kwnames);
                     return None;
                 }
                 node_object = value;
+                node_supplied = true;
             } else if keyword_matches(kwnames, index, c"clock_seq".as_ptr()) {
-                if !clock_seq_object.is_null() {
+                if clock_seq_supplied {
                     call_original(callable, args, nargsf, kwnames);
                     return None;
                 }
                 clock_seq_object = value;
+                clock_seq_supplied = true;
             } else {
                 call_original(callable, args, nargsf, kwnames);
                 return None;
             }
         }
-        Some((node_object, clock_seq_object))
+        Some((node_object, clock_seq_object, node_supplied, clock_seq_supplied))
     }
+}
+
+unsafe fn current_getnode_borrowed() -> *mut PyObject {
+    unsafe {
+        let getnode = PyDict_GetItem(UUID_DICT, INTERNED_GETNODE);
+        if getnode.is_null() {
+            PyErr_SetString(PyExc_RuntimeError, c"uuideal: uuid.getnode is missing".as_ptr());
+        }
+        getnode
+    }
+}
+
+unsafe fn current_node_value() -> Option<u128> {
+    unsafe {
+        let node = PyDict_GetItem(UUID_DICT, INTERNED_NODE);
+        if node.is_null() || node == Py_None() || PyLong_Check(node) == 0 {
+            return None;
+        }
+        pylong_to_u128(node)
+    }
+}
+
+unsafe fn call_getnode_value(getnode: *mut PyObject) -> Option<u128> {
+    unsafe {
+        let result = PyObject_CallNoArgs(getnode);
+        if result.is_null() {
+            return None;
+        }
+        if PyLong_Check(result) == 0 {
+            Py_DECREF(result);
+            return None;
+        }
+        let value = PyLong_AsUnsignedLongLongMask(result) as u128;
+        Py_DECREF(result);
+        Some(value)
+    }
+}
+
+fn mask_default_node_value(node: u128) -> u128 {
+    node & 0xffffffffffff
+}
+
+unsafe fn validate_explicit_node_value(
+    _callable: *mut PyObject,
+    _args: *const *mut PyObject,
+    _nargsf: usize,
+    _kwnames: *mut PyObject,
+    node: u128,
+) -> Option<u128> {
+    unsafe {
+        if node < (1u128 << 48) {
+            Some(node)
+        } else {
+            PyErr_SetString(
+                PyExc_ValueError,
+                c"field 6 out of range (need a 48-bit value)".as_ptr(),
+            );
+            None
+        }
+    }
+}
+
+unsafe fn default_node_slow(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> Option<u128> {
+    unsafe {
+        let getnode = current_getnode_borrowed();
+        if getnode.is_null() {
+            return None;
+        }
+
+        let Some(node) = call_getnode_value(getnode) else {
+            call_original(callable, args, nargsf, kwnames);
+            return None;
+        };
+        let node = mask_default_node_value(node);
+
+        if getnode == ORIGINAL_GETNODE || getnode == TRUSTED_GETNODE {
+            DEFAULT_NODE.store(node as u64, Ordering::Relaxed);
+            DEFAULT_NODE_READY.store(true, Ordering::Relaxed);
+            GETNODE_MODE.store(GETNODE_MODE_TRUSTED, Ordering::Relaxed);
+            return Some(node);
+        }
+
+        if let Some(current_node) = current_node_value() {
+            if mask_default_node_value(current_node) == node {
+                trust_getnode_borrowed(getnode);
+                DEFAULT_NODE.store(node as u64, Ordering::Relaxed);
+                DEFAULT_NODE_READY.store(true, Ordering::Relaxed);
+                GETNODE_MODE.store(GETNODE_MODE_TRUSTED, Ordering::Relaxed);
+                return Some(node);
+            }
+        }
+
+        GETNODE_MODE.store(GETNODE_MODE_UNKNOWN, Ordering::Relaxed);
+        Some(node)
+    }
+}
+
+#[inline(always)]
+unsafe fn default_node(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> Option<u128> {
+    if GETNODE_MODE.load(Ordering::Relaxed) == GETNODE_MODE_TRUSTED
+        && DEFAULT_NODE_READY.load(Ordering::Relaxed)
+    {
+        return Some(DEFAULT_NODE.load(Ordering::Relaxed) as u128);
+    }
+
+    unsafe { default_node_slow(callable, args, nargsf, kwnames) }
 }
 
 unsafe fn resolve_node(
@@ -765,38 +1024,18 @@ unsafe fn resolve_node(
     node_object: *mut PyObject,
 ) -> Option<u128> {
     unsafe {
-        let node = if node_object.is_null() || node_object == Py_None() {
-            let getnode = attribute(UUID_MODULE, c"getnode".as_ptr());
-            if getnode.is_null() {
-                return None;
-            }
-            let result = PyObject_CallNoArgs(getnode);
-            Py_DECREF(getnode);
-            if result.is_null() {
-                return None;
-            }
-            let Some(value) = pylong_to_u128(result) else {
-                Py_DECREF(result);
-                call_original(callable, args, nargsf, kwnames);
-                return None;
-            };
-            Py_DECREF(result);
-            value
+        if node_object.is_null() || node_object == Py_None() {
+            default_node(callable, args, nargsf, kwnames)
         } else if PyLong_Check(node_object) != 0 {
             let Some(value) = pylong_to_u128(node_object) else {
                 call_original(callable, args, nargsf, kwnames);
                 return None;
             };
-            value
+            validate_explicit_node_value(callable, args, nargsf, kwnames, value)
         } else {
             call_original(callable, args, nargsf, kwnames);
-            return None;
-        };
-        if node >= (1u128 << 48) {
-            call_original(callable, args, nargsf, kwnames);
-            return None;
+            None
         }
-        Some(node)
     }
 }
 
@@ -845,6 +1084,50 @@ unsafe fn generate_timestamp_uuid(
     }
 }
 
+unsafe fn uuid1_from_generate_time_safe() -> *mut PyObject {
+    unsafe {
+        let result = PyObject_CallNoArgs(GENERATE_TIME_SAFE);
+        if result.is_null() {
+            return ptr::null_mut();
+        }
+        if PyTuple_Check(result) == 0 || PyTuple_Size(result) != 2 {
+            Py_DECREF(result);
+            return ptr::null_mut();
+        }
+        let uuid_time = PyTuple_GetItem(result, 0);
+        let safely_generated = PyTuple_GetItem(result, 1);
+
+        let Some(value) = bytes_to_uuid_int(uuid_time, false) else {
+            Py_DECREF(result);
+            return ptr::null_mut();
+        };
+
+        let safely_int = PyLong_AsLong(safely_generated);
+        let is_safe = if safely_int == -1 && !PyErr_Occurred().is_null() {
+            PyErr_Clear();
+            SAFE_UUID_UNKNOWN
+        } else if safely_int == 0 {
+            SAFE_UUID_SAFE
+        } else if safely_int == -1 {
+            SAFE_UUID_UNSAFE
+        } else {
+            SAFE_UUID_UNKNOWN
+        };
+
+        Py_DECREF(result);
+
+        let object = PyType_GenericAlloc(UUID_TYPE.cast::<PyTypeObject>(), 0);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+        if set_uuid_slots(object, value, is_safe) < 0 {
+            Py_DECREF(object);
+            return ptr::null_mut();
+        }
+        object
+    }
+}
+
 unsafe extern "C" fn uuid1_vectorcall(
     callable: *mut PyObject,
     args: *const *mut PyObject,
@@ -852,11 +1135,19 @@ unsafe extern "C" fn uuid1_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some((node_object, clock_seq_object)) =
+        let Some((node_object, clock_seq_object, node_supplied, clock_seq_supplied)) =
             parse_node_and_clock_seq(callable, args, nargsf, kwnames)
         else {
             return ptr::null_mut();
         };
+        if !GENERATE_TIME_SAFE.is_null() {
+            let node_is_none = !node_supplied || node_object.is_null() || node_object == Py_None();
+            let clock_seq_is_none =
+                !clock_seq_supplied || clock_seq_object.is_null() || clock_seq_object == Py_None();
+            if node_is_none && clock_seq_is_none {
+                return uuid1_from_generate_time_safe();
+            }
+        }
         let Some(node) = resolve_node(callable, args, nargsf, kwnames, node_object) else {
             return ptr::null_mut();
         };
@@ -880,7 +1171,7 @@ unsafe fn uuid6_generate(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some((node_object, clock_seq_object)) =
+        let Some((node_object, clock_seq_object, _node_supplied, _clock_seq_supplied)) =
             parse_node_and_clock_seq(callable, args, nargsf, kwnames)
         else {
             return ptr::null_mut();
@@ -1996,6 +2287,10 @@ unsafe fn load_uuid_references() -> c_int {
             return -1;
         }
         UUID_MODULE = module;
+        UUID_DICT = PyModule_GetDict(module);
+        if UUID_DICT.is_null() {
+            return -1;
+        }
         UUID_TYPE = attribute(module, c"UUID".as_ptr());
         SAFE_UUID_TYPE = attribute(module, c"SafeUUID".as_ptr());
         if SAFE_UUID_TYPE.is_null() {
@@ -2032,12 +2327,38 @@ unsafe fn load_uuid_references() -> c_int {
             INTERNED_INT = PyUnicode_InternFromString(c"int".as_ptr());
             INTERNED_IS_SAFE = PyUnicode_InternFromString(c"is_safe".as_ptr());
             INTERNED_VALUE = PyUnicode_InternFromString(c"value".as_ptr());
+            INTERNED_NODE = PyUnicode_InternFromString(c"_node".as_ptr());
+            INTERNED_GETNODE = PyUnicode_InternFromString(c"getnode".as_ptr());
+            INTERNED_GENERATE_TIME_SAFE = PyUnicode_InternFromString(c"_generate_time_safe".as_ptr());
             if INTERNED_INT.is_null()
                 || INTERNED_IS_SAFE.is_null()
                 || INTERNED_VALUE.is_null()
+                || INTERNED_NODE.is_null()
+                || INTERNED_GETNODE.is_null()
+                || INTERNED_GENERATE_TIME_SAFE.is_null()
             {
                 return -1;
             }
+        }
+        let gts = PyDict_GetItem(UUID_DICT, INTERNED_GENERATE_TIME_SAFE);
+        if gts.is_null() {
+            PyErr_Clear();
+            clear_generate_time_safe();
+        } else {
+            set_generate_time_safe_borrowed(gts);
+        }
+        if ORIGINAL_GETNODE.is_null() {
+            ORIGINAL_GETNODE = PyDict_GetItem(UUID_DICT, INTERNED_GETNODE);
+            if ORIGINAL_GETNODE.is_null() {
+                PyErr_SetString(PyExc_RuntimeError, c"uuideal: uuid.getnode is missing".as_ptr());
+                return -1;
+            }
+            Py_INCREF(ORIGINAL_GETNODE);
+            GETNODE_MODE.store(GETNODE_MODE_TRUSTED, Ordering::Relaxed);
+            invalidate_default_node_cache();
+        }
+        if install_uuid_dict_watcher() < 0 {
+            return -1;
         }
         if load_uuid_slot_offsets() < 0 {
             return -1;
