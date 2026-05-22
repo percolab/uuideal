@@ -135,23 +135,49 @@ unsafe fn set_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *
     }
 }
 
-unsafe fn set_owned_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *mut PyObject) {
-    unsafe {
-        let slot = slot_pointer(object, offset);
-        let previous = *slot;
-        *slot = value;
-        if !previous.is_null() {
-            Py_DECREF(previous);
-        }
-    }
-}
-
 unsafe fn slot_object(object: *mut PyObject, offset: Py_ssize_t) -> *mut PyObject {
     unsafe { *slot_pointer(object, offset) }
 }
 
 unsafe fn slot_pointer(object: *mut PyObject, offset: Py_ssize_t) -> *mut *mut PyObject {
     unsafe { object.cast::<u8>().offset(offset).cast::<*mut PyObject>() }
+}
+
+#[inline(always)]
+unsafe fn fill_uuid_slots_owned_int(
+    object: *mut PyObject,
+    int_object: *mut PyObject,
+    safety_value: *mut PyObject,
+) {
+    unsafe {
+        let int_slot = slot_pointer(object, INT_SLOT_OFFSET);
+        let is_safe_slot = slot_pointer(object, IS_SAFE_SLOT_OFFSET);
+        let previous_int = *int_slot;
+        let previous_is_safe = *is_safe_slot;
+
+        Py_INCREF(safety_value);
+        *int_slot = int_object;
+        *is_safe_slot = safety_value;
+
+        if !previous_int.is_null() {
+            Py_DECREF(previous_int);
+        }
+        if !previous_is_safe.is_null() {
+            Py_DECREF(previous_is_safe);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn fill_uuid_slots_borrowed_int(
+    object: *mut PyObject,
+    int_object: *mut PyObject,
+    safety_value: *mut PyObject,
+) {
+    unsafe {
+        Py_INCREF(int_object);
+        fill_uuid_slots_owned_int(object, int_object, safety_value);
+    }
 }
 
 unsafe fn invalidate_default_node_cache() {
@@ -272,19 +298,28 @@ unsafe fn install_uuid_dict_watcher() -> c_int {
     }
 }
 
-unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObject) -> c_int {
+#[inline(always)]
+unsafe fn init_uuid_slots_from_value(object: *mut PyObject, value: u128) -> c_int {
     unsafe {
         let int_object = u128_to_pylong(value);
         if int_object.is_null() {
             return -1;
         }
-        let safety_value = if is_safe.is_null() {
-            SAFE_UUID_UNKNOWN
-        } else {
-            is_safe
-        };
-        set_owned_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
-        set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+        fill_uuid_slots_owned_int(object, int_object, SAFE_UUID_UNKNOWN);
+        0
+    }
+}
+
+unsafe fn set_uuid_slots(object: *mut PyObject, value: u128, is_safe: *mut PyObject) -> c_int {
+    unsafe {
+        if is_safe.is_null() {
+            return init_uuid_slots_from_value(object, value);
+        }
+        let int_object = u128_to_pylong(value);
+        if int_object.is_null() {
+            return -1;
+        }
+        fill_uuid_slots_owned_int(object, int_object, is_safe);
         0
     }
 }
@@ -300,8 +335,7 @@ unsafe fn set_uuid_slots_from_pylong(
         } else {
             is_safe
         };
-        set_slot_by_offset(object, INT_SLOT_OFFSET, int_object);
-        set_slot_by_offset(object, IS_SAFE_SLOT_OFFSET, safety_value);
+        fill_uuid_slots_borrowed_int(object, int_object, safety_value);
         0
     }
 }
@@ -693,9 +727,7 @@ unsafe fn allocate_uuid(value: u128) -> *mut PyObject {
             Py_DECREF(object);
             return ptr::null_mut();
         }
-        Py_INCREF(SAFE_UUID_UNKNOWN);
-        *slot_pointer(object, INT_SLOT_OFFSET) = int_object;
-        *slot_pointer(object, IS_SAFE_SLOT_OFFSET) = SAFE_UUID_UNKNOWN;
+        fill_uuid_slots_owned_int(object, int_object, SAFE_UUID_UNKNOWN);
         object
     }
 }
@@ -1292,7 +1324,7 @@ unsafe extern "C" fn uuid_init_vectorcall(
 
         if positional_count == 2 && nkw == 0 {
             if let Some(value) = parse_uuid_hex_pyunicode(*args.add(1)) {
-                if set_uuid_slots(self_object, value, ptr::null_mut()) < 0 {
+                if init_uuid_slots_from_value(self_object, value) < 0 {
                     return ptr::null_mut();
                 }
                 return none();
@@ -1303,7 +1335,7 @@ unsafe extern "C" fn uuid_init_vectorcall(
             let kw_value = *args.add(1);
             if keyword_matches(kwnames, 0, c"hex".as_ptr()) {
                 if let Some(value) = parse_uuid_hex_pyunicode(kw_value) {
-                    if set_uuid_slots(self_object, value, ptr::null_mut()) < 0 {
+                    if init_uuid_slots_from_value(self_object, value) < 0 {
                         return ptr::null_mut();
                     }
                     return none();
