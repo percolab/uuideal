@@ -2,6 +2,7 @@
 
 use core::ffi::{c_char, c_int, c_long, c_ulonglong, c_void};
 use pyo3_ffi::*;
+use std::ffi::CString;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -12,6 +13,7 @@ const GETNODE_MODE_TRUSTED: u8 = 0;
 const GETNODE_MODE_UNKNOWN: u8 = 1;
 
 static PATCHED: AtomicBool = AtomicBool::new(false);
+static AT_FORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static DEFAULT_NODE_READY: AtomicBool = AtomicBool::new(false);
 static DEFAULT_NODE: AtomicU64 = AtomicU64::new(0);
 static GETNODE_MODE: AtomicU8 = AtomicU8::new(GETNODE_MODE_TRUSTED);
@@ -2609,6 +2611,9 @@ unsafe extern "C" fn py_uuid7(
 unsafe extern "C" fn py_enable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if !PATCHED.load(Ordering::SeqCst) {
+            if register_reseed_at_fork() < 0 {
+                return ptr::null_mut();
+            }
             if apply_all_patches() < 0 {
                 return ptr::null_mut();
             }
@@ -2634,7 +2639,96 @@ unsafe extern "C" fn py_enabled(_self: *mut PyObject, _args: *mut PyObject) -> *
     unsafe { PyBool_FromLong(PATCHED.load(Ordering::SeqCst) as c_long) }
 }
 
-static mut METHODS: [PyMethodDef; 9] = [PyMethodDef::zeroed(); 9];
+unsafe extern "C" fn py_reseed_rng(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match rand::rng().reseed() {
+            Ok(()) => none(),
+            Err(err) => {
+                let message = match CString::new(err.to_string()) {
+                    Ok(message) => message,
+                    Err(_) => CString::new("failed to reseed random number generator")
+                        .expect("static error message has no interior nul"),
+                };
+                PyErr_SetString(PyExc_OSError, message.as_ptr());
+                ptr::null_mut()
+            }
+        }
+    }
+}
+
+unsafe fn register_reseed_at_fork() -> c_int {
+    unsafe {
+        if AT_FORK_REGISTERED.load(Ordering::SeqCst) {
+            return 0;
+        }
+
+        let os_module = PyImport_ImportModule(c"os".as_ptr());
+        if os_module.is_null() {
+            return -1;
+        }
+
+        let register_at_fork = PyObject_GetAttrString(os_module, c"register_at_fork".as_ptr());
+        Py_DECREF(os_module);
+        if register_at_fork.is_null() {
+            PyErr_Clear();
+            AT_FORK_REGISTERED.store(true, Ordering::SeqCst);
+            return 0;
+        }
+
+        let uuideal_module = PyImport_ImportModule(c"uuideal._uuideal".as_ptr());
+        if uuideal_module.is_null() {
+            Py_DECREF(register_at_fork);
+            return -1;
+        }
+
+        let reseed_rng = PyObject_GetAttrString(uuideal_module, c"reseed_rng".as_ptr());
+        Py_DECREF(uuideal_module);
+        if reseed_rng.is_null() {
+            Py_DECREF(register_at_fork);
+            return -1;
+        }
+
+        let args = PyTuple_New(0);
+        if args.is_null() {
+            Py_DECREF(reseed_rng);
+            Py_DECREF(register_at_fork);
+            return -1;
+        }
+
+        let kwargs = PyDict_New();
+        if kwargs.is_null() {
+            Py_DECREF(args);
+            Py_DECREF(reseed_rng);
+            Py_DECREF(register_at_fork);
+            return -1;
+        }
+
+        if PyDict_SetItemString(kwargs, c"after_in_child".as_ptr(), reseed_rng) < 0 {
+            Py_DECREF(kwargs);
+            Py_DECREF(args);
+            Py_DECREF(reseed_rng);
+            Py_DECREF(register_at_fork);
+            return -1;
+        }
+
+        let result = PyObject_Call(register_at_fork, args, kwargs);
+
+        Py_DECREF(kwargs);
+        Py_DECREF(args);
+        Py_DECREF(reseed_rng);
+        Py_DECREF(register_at_fork);
+
+        if result.is_null() {
+            return -1;
+        }
+
+        Py_DECREF(result);
+        AT_FORK_REGISTERED.store(true, Ordering::SeqCst);
+        0
+    }
+}
+
+static mut METHODS: [PyMethodDef; 10] = [PyMethodDef::zeroed(); 10];
 
 unsafe fn init_methods() {
     unsafe {
@@ -2694,7 +2788,15 @@ unsafe fn init_methods() {
             ml_flags: METH_FASTCALL | METH_KEYWORDS,
             ml_doc: c"Generate a version 7 UUID.".as_ptr(),
         };
-        METHODS[8] = PyMethodDef::zeroed();
+        METHODS[7] = PyMethodDef {
+            ml_name: c"reseed_rng".as_ptr(),
+            ml_meth: PyMethodDefPointer {
+                PyCFunction: py_reseed_rng,
+            },
+            ml_flags: METH_NOARGS,
+            ml_doc: c"Reseed the Rust random number generator.".as_ptr(),
+        };
+        METHODS[9] = PyMethodDef::zeroed();
     }
 }
 
