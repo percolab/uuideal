@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3-ffi/extension-module"]
-module-name = "uuideal._uuideal"
+module-name = "uuideal.__init__"
 python-source = "."
 
 [project]

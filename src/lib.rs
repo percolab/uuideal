@@ -2723,7 +2723,7 @@ unsafe fn register_reseed_at_fork() -> c_int {
             return 0;
         }
 
-        let uuideal_module = PyImport_ImportModule(c"uuideal._uuideal".as_ptr());
+        let uuideal_module = PyImport_ImportModule(c"uuideal".as_ptr());
         if uuideal_module.is_null() {
             Py_DECREF(register_at_fork);
             return -1;
@@ -2834,7 +2834,7 @@ unsafe fn init_methods() {
 
 static mut MODULE_DEF: PyModuleDef = PyModuleDef {
     m_base: PyModuleDef_HEAD_INIT,
-    m_name: c"uuideal._uuideal".as_ptr(),
+    m_name: c"uuideal".as_ptr(),
     m_doc: c"Vectorcall patches for stdlib uuid.".as_ptr(),
     m_size: 0,
     m_methods: ptr::null_mut(),
@@ -2845,7 +2845,7 @@ static mut MODULE_DEF: PyModuleDef = PyModuleDef {
 };
 
 #[no_mangle]
-pub unsafe extern "C" fn PyInit__uuideal() -> *mut PyObject {
+pub unsafe extern "C" fn PyInit_uuideal() -> *mut PyObject {
     unsafe {
         init_methods();
         MODULE_DEF.m_methods = ptr::addr_of_mut!(METHODS).cast::<PyMethodDef>();
