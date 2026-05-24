@@ -349,9 +349,6 @@ const PYLONG_MASK: u128 = (1u128 << PYLONG_SHIFT) - 1;
 struct PyLongInternals {
     ob_refcnt: Py_ssize_t,
     ob_type: *mut PyTypeObject,
-    #[cfg(not(Py_3_12))]
-    ob_size: Py_ssize_t,
-    #[cfg(Py_3_12)]
     lv_tag: usize,
     ob_digit: [u32; 0],
 }
@@ -367,15 +364,7 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
 
             let long = object.cast::<PyLongInternals>();
 
-            #[cfg(not(Py_3_12))]
-            {
-                (*long).ob_size = 5;
-            }
-
-            #[cfg(Py_3_12)]
-            {
-                (*long).lv_tag = 5 << 3;
-            }
+            (*long).lv_tag = 5 << 3;
 
             let digits = (*long).ob_digit.as_mut_ptr();
             *digits = (value & PYLONG_MASK) as u32;
@@ -408,15 +397,7 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
 
         let long = object.cast::<PyLongInternals>();
 
-        #[cfg(not(Py_3_12))]
-        {
-            (*long).ob_size = ndigits as Py_ssize_t;
-        }
-
-        #[cfg(Py_3_12)]
-        {
-            (*long).lv_tag = if ndigits == 0 { 1 } else { ndigits << 3 };
-        }
+        (*long).lv_tag = if ndigits == 0 { 1 } else { ndigits << 3 };
 
         let digits = (*long).ob_digit.as_mut_ptr();
         let mut remaining = value;
@@ -433,16 +414,6 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     unsafe {
         let long = object.cast::<PyLongInternals>();
 
-        #[cfg(not(Py_3_12))]
-        let ndigits = {
-            let s = (*long).ob_size;
-            if s < 0 {
-                return None;
-            }
-            s as usize
-        };
-
-        #[cfg(Py_3_12)]
         let ndigits = {
             let tag = (*long).lv_tag;
             match tag & 3 {
