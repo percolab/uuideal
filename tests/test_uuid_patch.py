@@ -95,7 +95,7 @@ def test_install_preserves_function_identities() -> None:
         assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
-    assert uuideal.enabled()
+    assert uuideal.installed()
 
     uuideal.uninstall()
     uuideal.uninstall()
@@ -108,7 +108,7 @@ def test_install_preserves_function_identities() -> None:
         assert uuid.uuid7 is uuid7
     assert uuid.UUID.__init__ is uuid_class_init
     assert uuid.UUID.__str__ is uuid_class_str
-    assert not uuideal.enabled()
+    assert not uuideal.installed()
 
 
 @pytest.mark.parametrize(

@@ -2656,7 +2656,7 @@ unsafe extern "C" fn py_uuid7(
     }
 }
 
-unsafe extern "C" fn py_enable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn py_install(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if !PATCHED.load(Ordering::SeqCst) {
             if register_reseed_at_fork() < 0 {
@@ -2671,7 +2671,7 @@ unsafe extern "C" fn py_enable(_self: *mut PyObject, _args: *mut PyObject) -> *m
     }
 }
 
-unsafe extern "C" fn py_disable(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn py_uninstall(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if PATCHED.load(Ordering::SeqCst) {
             if restore_all_patches() < 0 {
@@ -2683,7 +2683,7 @@ unsafe extern "C" fn py_disable(_self: *mut PyObject, _args: *mut PyObject) -> *
     }
 }
 
-unsafe extern "C" fn py_enabled(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn py_installed(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe { PyBool_FromLong(PATCHED.load(Ordering::SeqCst) as c_long) }
 }
 
@@ -2776,51 +2776,35 @@ unsafe fn register_reseed_at_fork() -> c_int {
     }
 }
 
-static mut METHODS: [PyMethodDef; 10] = [PyMethodDef::zeroed(); 10];
+static mut METHODS: [PyMethodDef; 8] = [PyMethodDef::zeroed(); 8];
 
 unsafe fn init_methods() {
     unsafe {
         METHODS[0] = PyMethodDef {
-            ml_name: c"enable".as_ptr(),
-            ml_meth: PyMethodDefPointer {
-                PyCFunction: py_enable,
-            },
-            ml_flags: METH_NOARGS,
-            ml_doc: c"Enable uuid vectorcall patches.".as_ptr(),
-        };
-        METHODS[1] = PyMethodDef {
             ml_name: c"install".as_ptr(),
             ml_meth: PyMethodDefPointer {
-                PyCFunction: py_enable,
+                PyCFunction: py_install,
             },
             ml_flags: METH_NOARGS,
-            ml_doc: c"Enable uuid vectorcall patches.".as_ptr(),
+            ml_doc: c"Install uuid vectorcall patches.".as_ptr(),
         };
-        METHODS[2] = PyMethodDef {
-            ml_name: c"disable".as_ptr(),
-            ml_meth: PyMethodDefPointer {
-                PyCFunction: py_disable,
-            },
-            ml_flags: METH_NOARGS,
-            ml_doc: c"Disable uuid vectorcall patches.".as_ptr(),
-        };
-        METHODS[3] = PyMethodDef {
+        METHODS[1] = PyMethodDef {
             ml_name: c"uninstall".as_ptr(),
             ml_meth: PyMethodDefPointer {
-                PyCFunction: py_disable,
+                PyCFunction: py_uninstall,
             },
             ml_flags: METH_NOARGS,
-            ml_doc: c"Disable uuid vectorcall patches.".as_ptr(),
+            ml_doc: c"Uninstall uuid vectorcall patches.".as_ptr(),
         };
-        METHODS[4] = PyMethodDef {
-            ml_name: c"enabled".as_ptr(),
+        METHODS[2] = PyMethodDef {
+            ml_name: c"installed".as_ptr(),
             ml_meth: PyMethodDefPointer {
-                PyCFunction: py_enabled,
+                PyCFunction: py_installed,
             },
             ml_flags: METH_NOARGS,
-            ml_doc: c"Return whether uuid vectorcall patches are enabled.".as_ptr(),
+            ml_doc: c"Return whether uuid vectorcall patches are installed.".as_ptr(),
         };
-        METHODS[5] = PyMethodDef {
+        METHODS[3] = PyMethodDef {
             ml_name: c"uuid6".as_ptr(),
             ml_meth: PyMethodDefPointer {
                 PyCFunctionFastWithKeywords: py_uuid6,
@@ -2828,7 +2812,7 @@ unsafe fn init_methods() {
             ml_flags: METH_FASTCALL | METH_KEYWORDS,
             ml_doc: c"Generate a version 6 UUID.".as_ptr(),
         };
-        METHODS[6] = PyMethodDef {
+        METHODS[4] = PyMethodDef {
             ml_name: c"uuid7".as_ptr(),
             ml_meth: PyMethodDefPointer {
                 PyCFunctionFastWithKeywords: py_uuid7,
@@ -2836,7 +2820,7 @@ unsafe fn init_methods() {
             ml_flags: METH_FASTCALL | METH_KEYWORDS,
             ml_doc: c"Generate a version 7 UUID.".as_ptr(),
         };
-        METHODS[7] = PyMethodDef {
+        METHODS[5] = PyMethodDef {
             ml_name: c"reseed_rng".as_ptr(),
             ml_meth: PyMethodDefPointer {
                 PyCFunction: py_reseed_rng,
@@ -2844,7 +2828,7 @@ unsafe fn init_methods() {
             ml_flags: METH_NOARGS,
             ml_doc: c"Reseed the Rust random number generator.".as_ptr(),
         };
-        METHODS[9] = PyMethodDef::zeroed();
+        METHODS[7] = PyMethodDef::zeroed();
     }
 }
 
