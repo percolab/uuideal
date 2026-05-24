@@ -42,6 +42,7 @@ static mut INTERNED_GENERATE_TIME_SAFE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_SAFE: *mut PyObject = ptr::null_mut();
 static mut SAFE_UUID_UNSAFE: *mut PyObject = ptr::null_mut();
 static mut GENERATE_TIME_SAFE: *mut PyObject = ptr::null_mut();
+static mut RANDOM_GETRANDBITS: *mut PyObject = ptr::null_mut();
 
 #[repr(C)]
 struct PyDescrObjectLayout {
@@ -212,6 +213,15 @@ unsafe fn clear_generate_time_safe() {
         if !GENERATE_TIME_SAFE.is_null() {
             Py_DECREF(GENERATE_TIME_SAFE);
             GENERATE_TIME_SAFE = ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn clear_random_getrandbits() {
+    unsafe {
+        if !RANDOM_GETRANDBITS.is_null() {
+            Py_DECREF(RANDOM_GETRANDBITS);
+            RANDOM_GETRANDBITS = ptr::null_mut();
         }
     }
 }
@@ -1278,6 +1288,164 @@ unsafe extern "C" fn uuid7_vectorcall(
         }
         uuid7_generate()
     }
+}
+
+unsafe fn random_getrandbits_borrowed() -> *mut PyObject {
+    unsafe {
+        if !RANDOM_GETRANDBITS.is_null() {
+            return RANDOM_GETRANDBITS;
+        }
+
+        let random_module = PyImport_ImportModule(c"random".as_ptr());
+        if random_module.is_null() {
+            return ptr::null_mut();
+        }
+
+        let getrandbits = attribute(random_module, c"getrandbits".as_ptr());
+        Py_DECREF(random_module);
+        if getrandbits.is_null() {
+            return ptr::null_mut();
+        }
+
+        RANDOM_GETRANDBITS = getrandbits;
+        RANDOM_GETRANDBITS
+    }
+}
+
+#[inline(always)]
+unsafe fn uuid8_random_bits(bits: c_long, mask: u128) -> Option<u128> {
+    unsafe {
+        let getrandbits = random_getrandbits_borrowed();
+        if getrandbits.is_null() {
+            return None;
+        }
+
+        let bits_object = PyLong_FromLong(bits);
+        if bits_object.is_null() {
+            return None;
+        }
+
+        let value_object = PyObject_CallOneArg(getrandbits, bits_object);
+        Py_DECREF(bits_object);
+        if value_object.is_null() {
+            return None;
+        }
+
+        let value = PyLong_AsUnsignedLongLongMask(value_object) as u128;
+        Py_DECREF(value_object);
+        if !PyErr_Occurred().is_null() {
+            return None;
+        }
+
+        Some(value & mask)
+    }
+}
+
+#[inline(always)]
+unsafe fn uuid8_block_value(object: *mut PyObject, bits: c_long, mask: u128) -> Option<u128> {
+    unsafe {
+        if object.is_null() || object == Py_None() {
+            uuid8_random_bits(bits, mask)
+        } else if PyLong_Check(object) != 0 {
+            Some((PyLong_AsUnsignedLongLongMask(object) as u128) & mask)
+        } else {
+            None
+        }
+    }
+}
+
+unsafe fn uuid8_generate(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        let positional_count = PyVectorcall_NARGS(nargsf);
+        if positional_count > 3 || keyword_count(kwnames) > 3 {
+            return call_original(callable, args, nargsf, kwnames);
+        }
+
+        let mut a_object = if positional_count >= 1 {
+            *args
+        } else {
+            Py_None()
+        };
+        let mut b_object = if positional_count >= 2 {
+            *args.add(1)
+        } else {
+            Py_None()
+        };
+        let mut c_object = if positional_count >= 3 {
+            *args.add(2)
+        } else {
+            Py_None()
+        };
+
+        let mut a_supplied = positional_count >= 1;
+        let mut b_supplied = positional_count >= 2;
+        let mut c_supplied = positional_count >= 3;
+
+        for index in 0..keyword_count(kwnames) {
+            let value = *args.add(positional_count as usize + index as usize);
+            if keyword_matches(kwnames, index, c"a".as_ptr()) {
+                if a_supplied {
+                    return call_original(callable, args, nargsf, kwnames);
+                }
+                a_object = value;
+                a_supplied = true;
+            } else if keyword_matches(kwnames, index, c"b".as_ptr()) {
+                if b_supplied {
+                    return call_original(callable, args, nargsf, kwnames);
+                }
+                b_object = value;
+                b_supplied = true;
+            } else if keyword_matches(kwnames, index, c"c".as_ptr()) {
+                if c_supplied {
+                    return call_original(callable, args, nargsf, kwnames);
+                }
+                c_object = value;
+                c_supplied = true;
+            } else {
+                return call_original(callable, args, nargsf, kwnames);
+            }
+        }
+
+        let Some(a) = uuid8_block_value(a_object, 48, 0xffff_ffff_ffff) else {
+            if !PyErr_Occurred().is_null() {
+                return ptr::null_mut();
+            }
+            return call_original(callable, args, nargsf, kwnames);
+        };
+        let Some(b) = uuid8_block_value(b_object, 12, 0x0fff) else {
+            if !PyErr_Occurred().is_null() {
+                return ptr::null_mut();
+            }
+            return call_original(callable, args, nargsf, kwnames);
+        };
+        let Some(c) = uuid8_block_value(c_object, 62, 0x3fff_ffff_ffff_ffff) else {
+            if !PyErr_Occurred().is_null() {
+                return ptr::null_mut();
+            }
+            return call_original(callable, args, nargsf, kwnames);
+        };
+
+        let mut value = a << 80;
+        value |= b << 64;
+        value |= c;
+        value |= (8u128 << 76) | (0x8000u128 << 48);
+
+        allocate_uuid(value)
+    }
+}
+
+unsafe extern "C" fn uuid8_vectorcall(
+    callable: *mut PyObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { uuid8_generate(callable, args, nargsf, kwnames) }
 }
 
 unsafe fn bytes_to_uuid_int(object: *mut PyObject, little_endian: bool) -> Option<u128> {
@@ -2468,6 +2636,7 @@ unsafe fn apply_all_patches() -> c_int {
         let optional_module_patches = [
             (c"uuid6".as_ptr(), uuid6_vectorcall as vectorcallfunc),
             (c"uuid7".as_ptr(), uuid7_vectorcall as vectorcallfunc),
+            (c"uuid8".as_ptr(), uuid8_vectorcall as vectorcallfunc),
         ];
         for (name, vectorcall) in optional_module_patches {
             if patch_optional_module_function(UUID_MODULE, name, vectorcall) < 0 {
@@ -2572,6 +2741,7 @@ unsafe fn restore_all_patches() -> c_int {
             c"uuid5".as_ptr(),
             c"uuid6".as_ptr(),
             c"uuid7".as_ptr(),
+            c"uuid8".as_ptr(),
         ] {
             if restore_module_function(UUID_MODULE, name) < 0 {
                 return -1;
@@ -2656,6 +2826,20 @@ unsafe extern "C" fn py_uuid7(
     }
 }
 
+unsafe extern "C" fn py_uuid8(
+    _self: *mut PyObject,
+    args: *const *mut PyObject,
+    nargs: Py_ssize_t,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        if load_uuid_references() < 0 {
+            return ptr::null_mut();
+        }
+        uuid8_generate(ptr::null_mut(), args, nargs as usize, kwnames)
+    }
+}
+
 unsafe extern "C" fn py_install(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
         if !PATCHED.load(Ordering::SeqCst) {
@@ -2679,6 +2863,7 @@ unsafe extern "C" fn py_uninstall(_self: *mut PyObject, _args: *mut PyObject) ->
             }
             PATCHED.store(false, Ordering::SeqCst);
         }
+        clear_random_getrandbits();
         none()
     }
 }
@@ -2776,7 +2961,7 @@ unsafe fn register_reseed_at_fork() -> c_int {
     }
 }
 
-static mut METHODS: [PyMethodDef; 8] = [PyMethodDef::zeroed(); 8];
+static mut METHODS: [PyMethodDef; 9] = [PyMethodDef::zeroed(); 9];
 
 unsafe fn init_methods() {
     unsafe {
@@ -2821,6 +3006,14 @@ unsafe fn init_methods() {
             ml_doc: c"Generate a version 7 UUID.".as_ptr(),
         };
         METHODS[5] = PyMethodDef {
+            ml_name: c"uuid8".as_ptr(),
+            ml_meth: PyMethodDefPointer {
+                PyCFunctionFastWithKeywords: py_uuid8,
+            },
+            ml_flags: METH_FASTCALL | METH_KEYWORDS,
+            ml_doc: c"Generate a version 8 UUID.".as_ptr(),
+        };
+        METHODS[6] = PyMethodDef {
             ml_name: c"reseed_rng".as_ptr(),
             ml_meth: PyMethodDefPointer {
                 PyCFunction: py_reseed_rng,
@@ -2828,7 +3021,7 @@ unsafe fn init_methods() {
             ml_flags: METH_NOARGS,
             ml_doc: c"Reseed the Rust random number generator.".as_ptr(),
         };
-        METHODS[7] = PyMethodDef::zeroed();
+        METHODS[8] = PyMethodDef::zeroed();
     }
 }
 

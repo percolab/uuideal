@@ -471,6 +471,38 @@ def test_fuzz_representative_invalid_calls_match_stdlib(call: object) -> None:
 
 @FUZZ_SETTINGS
 @given(
+    st.one_of(st.none(), st.integers(min_value=0, max_value=(1 << 64) - 1)),
+    st.one_of(st.none(), st.integers(min_value=0, max_value=(1 << 64) - 1)),
+    st.one_of(st.none(), st.integers(min_value=0, max_value=(1 << 80) - 1)),
+)
+def test_fuzz_uuid8_custom_blocks_match_stdlib_static_fields(
+    a: int | None,
+    b: int | None,
+    c: int | None,
+) -> None:
+    if not hasattr(uuid, "uuid8"):
+        pytest.skip("stdlib uuid.uuid8 is not available on this Python version")
+
+    expected = uuid.uuid8(a, b, c)
+
+    uuideal.install()
+
+    actual = uuid.uuid8(a, b, c)
+    assert type(actual) is type(expected)
+    assert actual.version == expected.version
+    assert actual.variant == expected.variant
+    if a is not None:
+        assert (actual.int >> 80) == (expected.int >> 80)
+    if b is not None:
+        assert ((actual.int >> 64) & 0x0FFF) == ((expected.int >> 64) & 0x0FFF)
+    if c is not None:
+        assert (actual.int & 0x3FFF_FFFF_FFFF_FFFF) == (
+            expected.int & 0x3FFF_FFFF_FFFF_FFFF
+        )
+
+
+@FUZZ_SETTINGS
+@given(
     st.sampled_from(["uuid1", "uuid6"]),
     st.one_of(
         st.integers(max_value=-1),
