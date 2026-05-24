@@ -2849,9 +2849,6 @@ pub unsafe extern "C" fn PyInit_uuideal() -> *mut PyObject {
     unsafe {
         init_methods();
         MODULE_DEF.m_methods = ptr::addr_of_mut!(METHODS).cast::<PyMethodDef>();
-        if load_uuid_references() < 0 {
-            return ptr::null_mut();
-        }
         PyModuleDef_Init(ptr::addr_of_mut!(MODULE_DEF))
     }
 }
