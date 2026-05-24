@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import copy
+import operator
 import pickle
+import re
 import sys
 import threading
 import timeit
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -239,34 +242,38 @@ def test_uuid7_shortcut_and_patch_have_expected_fields() -> None:
         assert len({value.int for value in patched_values}) == len(patched_values)
         assert patched_values == sorted(patched_values)
 
-
-def test_error_equivalence_for_representative_invalid_inputs() -> None:
-    invalid_calls = [
-        lambda: uuid.UUID(),
-        lambda: uuid.UUID("bad"),
-        lambda: uuid.UUID(bytes=b"short"),
-        lambda: uuid.UUID(int=1 << 128),
-        lambda: uuid.UUID(fields=(1, 2, 3)),
+INVALID_UUID_CALLS = [
+    pytest.param(lambda: uuid.UUID(), id="uuid.UUID()"),
+    pytest.param(lambda: uuid.UUID("bad"), id='uuid.UUID("bad")'),
+    pytest.param(lambda: uuid.UUID(bytes=b"short"), id='uuid.UUID(bytes=b"short")'),
+    pytest.param(lambda: uuid.UUID(int=1 << 128), id="uuid.UUID(int=1 << 128)"),
+    pytest.param(lambda: uuid.UUID(fields=(1, 2, 3)), id="uuid.UUID(fields=(1, 2, 3))"),
+    pytest.param(
         lambda: uuid.UUID(
-            "12345678123456781234567812345678", hex="12345678123456781234567812345678"
+            "12345678123456781234567812345678",
+            hex="12345678123456781234567812345678",
         ),
-        lambda: uuid.uuid4(1),
-        lambda: uuid.uuid3(uuid.NAMESPACE_DNS),
-    ]
-    expected_errors: list[tuple[type[BaseException], str]] = []
-    for call in invalid_calls:
-        with pytest.raises(Exception) as captured:
-            call()
-        expected_errors.append((type(captured.value), str(captured.value)))
+        id='uuid.UUID("12345678123456781234567812345678", hex="12345678123456781234567812345678")',
+    ),
+    pytest.param(lambda: uuid.uuid4(1), id="uuid.uuid4(1)"),
+    pytest.param(lambda: uuid.uuid3(uuid.NAMESPACE_DNS), id="uuid.uuid3(uuid.NAMESPACE_DNS)"),
+]
+
+
+@pytest.mark.parametrize("call", INVALID_UUID_CALLS)
+def test_error_equivalence_for_representative_invalid_inputs(
+    call: Callable[[], object],
+) -> None:
+    with pytest.raises(Exception) as captured:
+        call()
+
+    expected_type = type(captured.value)
+    expected_message = str(captured.value)
 
     uuideal.install()
 
-    for call, (expected_type, expected_message) in zip(invalid_calls, expected_errors, strict=True):
-        with pytest.raises(expected_type) as captured:
-            call()
-        assert str(captured.value) == expected_message
-
-
+    with pytest.raises(expected_type, match=re.escape(expected_message)):
+        call()
 def test_serialization_copy_and_subclassing() -> None:
     class MyUUID(uuid.UUID):
         def __init__(self, *args, custom_field=None, **kwargs):
@@ -288,6 +295,86 @@ def test_serialization_copy_and_subclassing() -> None:
     assert type(custom) is MyUUID
     assert custom.custom_field == "kept"
     assert custom == expected
+
+
+def test_from_int_matches_stdlib_and_preserves_subclasses() -> None:
+    if not hasattr(uuid.UUID, "_from_int"):
+        pytest.skip("uuid.UUID._from_int is not available on this Python version")
+
+    class MyUUID(uuid.UUID):
+        pass
+
+    value = 0x12345678123456789234567812345678
+    expected = uuid.UUID._from_int(value)
+    expected_subclass = MyUUID._from_int(value)
+
+    uuideal.install()
+
+    actual = uuid.UUID._from_int(value)
+    actual_subclass = MyUUID._from_int(value)
+
+    assert actual == expected
+    assert type(actual) is uuid.UUID
+    assert actual_subclass == expected_subclass
+    assert type(actual_subclass) is MyUUID
+    assert uuid.UUID._from_int(True).int is True
+
+    for invalid_value in (-1, 1 << 128):
+        with pytest.raises(AssertionError, match=repr(invalid_value)):
+            uuid.UUID._from_int(invalid_value)
+
+
+def test_native_state_methods_match_stdlib() -> None:
+    unknown = uuid.UUID(int=1)
+    safe = uuid.UUID(int=1, is_safe=uuid.SafeUUID.safe)
+    expected_unknown_state = unknown.__getstate__()
+    expected_safe_state = safe.__getstate__()
+
+    uuideal.install()
+
+    actual_unknown = uuid.UUID(int=1)
+    actual_safe = uuid.UUID(int=1, is_safe=uuid.SafeUUID.safe)
+    assert actual_unknown.__getstate__() == expected_unknown_state
+    assert actual_safe.__getstate__() == expected_safe_state
+
+    restored_unknown = object.__new__(uuid.UUID)
+    restored_unknown.__setstate__(expected_unknown_state)
+    assert restored_unknown == unknown
+    assert restored_unknown.is_safe is uuid.SafeUUID.unknown
+
+    restored_safe = object.__new__(uuid.UUID)
+    restored_safe.__setstate__(expected_safe_state)
+    assert restored_safe == safe
+    assert restored_safe.is_safe is uuid.SafeUUID.safe
+
+
+def test_native_comparison_and_hash_methods_match_stdlib() -> None:
+    left = uuid.UUID(int=1)
+    same = uuid.UUID(int=1)
+    right = uuid.UUID(int=2)
+    operations = (
+        operator.eq,
+        operator.lt,
+        operator.gt,
+        operator.le,
+        operator.ge,
+    )
+    expected = {operation: (operation(left, same), operation(left, right)) for operation in operations}
+    expected_hash = hash(left)
+    expected_not_implemented = uuid.UUID.__eq__(left, object())
+
+    uuideal.install()
+
+    actual_left = uuid.UUID(int=1)
+    actual_same = uuid.UUID(int=1)
+    actual_right = uuid.UUID(int=2)
+    actual = {
+        operation: (operation(actual_left, actual_same), operation(actual_left, actual_right))
+        for operation in operations
+    }
+    assert actual == expected
+    assert hash(actual_left) == expected_hash
+    assert uuid.UUID.__eq__(actual_left, object()) is expected_not_implemented
 
 
 def test_concurrent_uuid4_construction() -> None:
