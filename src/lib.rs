@@ -98,6 +98,7 @@ extern "C" {
     fn PyDict_Watch(watcher_id: c_int, dict: *mut PyObject) -> c_int;
 }
 
+#[inline(always)]
 unsafe fn incref(object: *mut PyObject) -> *mut PyObject {
     unsafe {
         Py_INCREF(object);
@@ -113,12 +114,21 @@ unsafe fn xdecref(object: *mut PyObject) {
     }
 }
 
+#[inline(always)]
 unsafe fn none() -> *mut PyObject {
-    unsafe { incref(Py_None()) }
+    unsafe { Py_None() }
 }
 
+#[inline(always)]
 unsafe fn not_implemented() -> *mut PyObject {
-    unsafe { incref(Py_NotImplemented()) }
+    unsafe { Py_NotImplemented() }
+}
+
+#[inline(always)]
+unsafe fn py_bool(value: bool) -> *mut PyObject {
+    unsafe {
+        if value { Py_True() } else { Py_False() }
+    }
 }
 
 unsafe fn attribute(object: *mut PyObject, name: *const c_char) -> *mut PyObject {
@@ -137,10 +147,12 @@ unsafe fn set_slot_by_offset(object: *mut PyObject, offset: Py_ssize_t, value: *
     }
 }
 
+#[inline(always)]
 unsafe fn slot_object(object: *mut PyObject, offset: Py_ssize_t) -> *mut PyObject {
     unsafe { *slot_pointer(object, offset) }
 }
 
+#[inline(always)]
 unsafe fn slot_pointer(object: *mut PyObject, offset: Py_ssize_t) -> *mut *mut PyObject {
     unsafe { object.cast::<u8>().offset(offset).cast::<*mut PyObject>() }
 }
@@ -453,6 +465,47 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     }
 }
 
+#[inline(always)]
+unsafe fn pylong_cmp_unsigned(a: *mut PyObject, b: *mut PyObject) -> Option<std::cmp::Ordering> {
+    unsafe {
+        let la = a.cast::<PyLongInternals>();
+        let lb = b.cast::<PyLongInternals>();
+
+        let tag_a = (*la).lv_tag;
+        let tag_b = (*lb).lv_tag;
+
+        if (tag_a & 3) == 2 || (tag_b & 3) == 2 {
+            return None;
+        }
+
+        let na = if (tag_a & 3) == 1 { 0 } else { tag_a >> 3 };
+        let nb = if (tag_b & 3) == 1 { 0 } else { tag_b >> 3 };
+
+        if na != nb {
+            return Some(na.cmp(&nb));
+        }
+
+        if na == 0 || na > 5 {
+            return if na == 0 { Some(std::cmp::Ordering::Equal) } else { None };
+        }
+
+        let da = (*la).ob_digit.as_ptr();
+        let db = (*lb).ob_digit.as_ptr();
+
+        let mut i = na;
+        while i > 0 {
+            i -= 1;
+            let ad = *da.add(i);
+            let bd = *db.add(i);
+            if ad != bd {
+                return Some(ad.cmp(&bd));
+            }
+        }
+        Some(std::cmp::Ordering::Equal)
+    }
+}
+
+#[inline(always)]
 unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
     unsafe {
         let int_object = slot_object(object, INT_SLOT_OFFSET);
@@ -463,6 +516,7 @@ unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
     }
 }
 
+#[inline(always)]
 unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
     unsafe { uuid_int_from_slot(object) }
 }
@@ -739,6 +793,7 @@ unsafe fn call_original(
     }
 }
 
+#[inline(always)]
 unsafe fn keyword_count(kwnames: *mut PyObject) -> Py_ssize_t {
     unsafe {
         if kwnames.is_null() {
@@ -749,6 +804,7 @@ unsafe fn keyword_count(kwnames: *mut PyObject) -> Py_ssize_t {
     }
 }
 
+#[inline(always)]
 unsafe fn keyword_name(kwnames: *mut PyObject, index: Py_ssize_t) -> *mut PyObject {
     unsafe { PyTuple_GetItem(kwnames, index) }
 }
@@ -1648,7 +1704,13 @@ unsafe extern "C" fn uuid_setattr_vectorcall(
         ptr::null_mut()
     }
 }
+const COMPARE_EQ: u8 = 0;
+const COMPARE_LT: u8 = 1;
+const COMPARE_GT: u8 = 2;
+const COMPARE_LE: u8 = 3;
+const COMPARE_GE: u8 = 4;
 
+#[inline(always)]
 unsafe fn rich_compare<const OP: u8>(
     callable: *mut PyObject,
     args: *const *mut PyObject,
@@ -1656,32 +1718,47 @@ unsafe fn rich_compare<const OP: u8>(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        if PyVectorcall_NARGS(nargsf) != 2 || keyword_count(kwnames) != 0 {
+        if PyVectorcall_NARGS(nargsf) != 2 || !kwnames.is_null() {
             return call_original(callable, args, nargsf, kwnames);
         }
         let self_object = *args;
         let other_object = *args.add(1);
-        let instance_check = PyObject_IsInstance(other_object, UUID_TYPE);
-        if instance_check < 0 {
-            return ptr::null_mut();
+
+        if (*other_object).ob_type != UUID_TYPE.cast::<PyTypeObject>() {
+            let instance_check = PyObject_IsInstance(other_object, UUID_TYPE);
+            if instance_check < 0 {
+                return ptr::null_mut();
+            }
+            if instance_check == 0 {
+                return not_implemented();
+            }
         }
-        if instance_check == 0 {
-            return not_implemented();
+
+        let self_int = slot_object(self_object, INT_SLOT_OFFSET);
+        let other_int = slot_object(other_object, INT_SLOT_OFFSET);
+
+        if self_int.is_null() || other_int.is_null() {
+            return call_original(callable, args, nargsf, kwnames);
         }
-        let Some(left) = uuid_int(self_object) else {
+
+        if self_int == other_int {
+            return py_bool(match OP {
+                COMPARE_LT | COMPARE_GT => false,
+                _ => true,
+            });
+        }
+
+        let Some(ordering) = pylong_cmp_unsigned(self_int, other_int) else {
             return call_original(callable, args, nargsf, kwnames);
         };
-        let Some(right) = uuid_int(other_object) else {
-            return call_original(callable, args, nargsf, kwnames);
-        };
-        let result = match OP {
-            0 => left == right,
-            1 => left < right,
-            2 => left > right,
-            3 => left <= right,
-            _ => left >= right,
-        };
-        PyBool_FromLong(result as c_long)
+
+        py_bool(match OP {
+            COMPARE_EQ => ordering.is_eq(),
+            COMPARE_LT => ordering.is_lt(),
+            COMPARE_GT => ordering.is_gt(),
+            COMPARE_LE => ordering.is_le(),
+            _ => ordering.is_ge(),
+        })
     }
 }
 
@@ -1691,7 +1768,7 @@ unsafe extern "C" fn uuid_eq_vectorcall(
     nargsf: usize,
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { rich_compare::<0>(callable, args, nargsf, kwnames) }
+    unsafe { rich_compare::<COMPARE_EQ>(callable, args, nargsf, kwnames) }
 }
 unsafe extern "C" fn uuid_lt_vectorcall(
     callable: *mut PyObject,
@@ -1699,7 +1776,7 @@ unsafe extern "C" fn uuid_lt_vectorcall(
     nargsf: usize,
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { rich_compare::<1>(callable, args, nargsf, kwnames) }
+    unsafe { rich_compare::<COMPARE_LT>(callable, args, nargsf, kwnames) }
 }
 unsafe extern "C" fn uuid_gt_vectorcall(
     callable: *mut PyObject,
@@ -1707,7 +1784,7 @@ unsafe extern "C" fn uuid_gt_vectorcall(
     nargsf: usize,
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { rich_compare::<2>(callable, args, nargsf, kwnames) }
+    unsafe { rich_compare::<COMPARE_GT>(callable, args, nargsf, kwnames) }
 }
 unsafe extern "C" fn uuid_le_vectorcall(
     callable: *mut PyObject,
@@ -1715,7 +1792,7 @@ unsafe extern "C" fn uuid_le_vectorcall(
     nargsf: usize,
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { rich_compare::<3>(callable, args, nargsf, kwnames) }
+    unsafe { rich_compare::<COMPARE_LE>(callable, args, nargsf, kwnames) }
 }
 unsafe extern "C" fn uuid_ge_vectorcall(
     callable: *mut PyObject,
@@ -1723,7 +1800,7 @@ unsafe extern "C" fn uuid_ge_vectorcall(
     nargsf: usize,
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { rich_compare::<4>(callable, args, nargsf, kwnames) }
+    unsafe { rich_compare::<COMPARE_GE>(callable, args, nargsf, kwnames) }
 }
 
 unsafe extern "C" fn uuid_bytes_vectorcall(
