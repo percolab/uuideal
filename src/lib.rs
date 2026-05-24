@@ -84,6 +84,16 @@ struct PyBytesObjectLayout {
 
 const PYASCII_STATE_ASCII: u32 = 1 << 6;
 
+#[cfg(Py_GIL_DISABLED)]
+const PY_ASNATIVEBYTES_NATIVE_ENDIAN: c_int = 3;
+#[cfg(Py_GIL_DISABLED)]
+const PY_ASNATIVEBYTES_UNSIGNED_BUFFER: c_int = 4;
+#[cfg(Py_GIL_DISABLED)]
+const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
+#[cfg(Py_GIL_DISABLED)]
+const PY_ASNATIVEBYTES_U128_FLAGS: c_int =
+    PY_ASNATIVEBYTES_NATIVE_ENDIAN | PY_ASNATIVEBYTES_UNSIGNED_BUFFER | PY_ASNATIVEBYTES_REJECT_NEGATIVE;
+
 type PyDictWatchCallback = Option<
     unsafe extern "C" fn(c_int, *mut PyObject, *mut PyObject, *mut PyObject) -> c_int,
 >;
@@ -94,6 +104,19 @@ extern "C" {
     fn PyVectorcall_Function(callable: *mut PyObject) -> Option<vectorcallfunc>;
     fn _PyLong_New(size: Py_ssize_t) -> *mut PyLongObject;
     fn PyLong_AsUnsignedLongLongMask(object: *mut PyObject) -> c_ulonglong;
+    #[cfg(Py_3_13)]
+    fn PyLong_FromUnsignedNativeBytes(
+        buffer: *const c_void,
+        n_bytes: usize,
+        flags: c_int,
+    ) -> *mut PyObject;
+    #[cfg(Py_3_13)]
+    fn PyLong_AsNativeBytes(
+        value: *mut PyObject,
+        buffer: *mut c_void,
+        n_bytes: Py_ssize_t,
+        flags: c_int,
+    ) -> Py_ssize_t;
     fn PyUnicode_New(size: Py_ssize_t, maxchar: u32) -> *mut PyObject;
     fn PyDict_AddWatcher(callback: PyDictWatchCallback) -> c_int;
     fn PyDict_Watch(watcher_id: c_int, dict: *mut PyObject) -> c_int;
@@ -375,6 +398,7 @@ struct PyLongInternals {
     ob_digit: [u32; 0],
 }
 
+#[cfg(not(Py_GIL_DISABLED))]
 unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     unsafe {
         let high_digit = (value >> (PYLONG_SHIFT * 4)) as u32;
@@ -432,6 +456,23 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
     }
 }
 
+#[cfg(Py_GIL_DISABLED)]
+unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
+    unsafe {
+        if value <= c_ulonglong::MAX as u128 {
+            return PyLong_FromUnsignedLongLong(value as c_ulonglong);
+        }
+
+        let bytes = value.to_ne_bytes();
+        PyLong_FromUnsignedNativeBytes(
+            bytes.as_ptr().cast::<c_void>(),
+            bytes.len(),
+            PY_ASNATIVEBYTES_NATIVE_ENDIAN,
+        )
+    }
+}
+
+#[cfg(not(Py_GIL_DISABLED))]
 unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     unsafe {
         let long = object.cast::<PyLongInternals>();
@@ -475,6 +516,35 @@ unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     }
 }
 
+#[cfg(Py_GIL_DISABLED)]
+unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
+    unsafe {
+        if PyLong_Check(object) == 0 {
+            return None;
+        }
+
+        let mut bytes = [0u8; 16];
+        let required = PyLong_AsNativeBytes(
+            object,
+            bytes.as_mut_ptr().cast::<c_void>(),
+            bytes.len() as Py_ssize_t,
+            PY_ASNATIVEBYTES_U128_FLAGS,
+        );
+
+        if required < 0 {
+            PyErr_Clear();
+            return None;
+        }
+
+        if required as usize > bytes.len() {
+            return None;
+        }
+
+        Some(u128::from_ne_bytes(bytes))
+    }
+}
+
+#[cfg(not(Py_GIL_DISABLED))]
 #[inline(always)]
 unsafe fn pylong_cmp_unsigned(a: *mut PyObject, b: *mut PyObject) -> Option<std::cmp::Ordering> {
     unsafe {
@@ -515,6 +585,16 @@ unsafe fn pylong_cmp_unsigned(a: *mut PyObject, b: *mut PyObject) -> Option<std:
     }
 }
 
+#[cfg(Py_GIL_DISABLED)]
+#[inline(always)]
+unsafe fn pylong_cmp_unsigned(a: *mut PyObject, b: *mut PyObject) -> Option<std::cmp::Ordering> {
+    unsafe {
+        let left = pylong_to_u128(a)?;
+        let right = pylong_to_u128(b)?;
+        Some(left.cmp(&right))
+    }
+}
+
 #[inline(always)]
 unsafe fn uuid_int_from_slot(object: *mut PyObject) -> Option<u128> {
     unsafe {
@@ -531,6 +611,7 @@ unsafe fn uuid_int(object: *mut PyObject) -> Option<u128> {
     unsafe { uuid_int_from_slot(object) }
 }
 
+#[cfg(not(Py_GIL_DISABLED))]
 unsafe fn ascii_unicode_bytes(object: *mut PyObject) -> Option<&'static [u8]> {
     unsafe {
         let unicode = object.cast::<PyASCIIObjectLayout>();
@@ -545,6 +626,23 @@ unsafe fn ascii_unicode_bytes(object: *mut PyObject) -> Option<&'static [u8]> {
             .cast::<u8>()
             .add(std::mem::size_of::<PyASCIIObjectLayout>());
         Some(std::slice::from_raw_parts(data, size as usize))
+    }
+}
+
+#[cfg(Py_GIL_DISABLED)]
+unsafe fn ascii_unicode_bytes(object: *mut PyObject) -> Option<&'static [u8]> {
+    unsafe {
+        let mut size: Py_ssize_t = 0;
+        let pointer = PyUnicode_AsUTF8AndSize(object, &mut size);
+        if pointer.is_null() || size < 0 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), size as usize);
+        if bytes.iter().all(|byte| *byte <= 0x7f) {
+            Some(bytes)
+        } else {
+            None
+        }
     }
 }
 
@@ -578,6 +676,7 @@ fn write_uuid_string(value: u128, output: &mut [u8; 36]) {
     output[24..36].copy_from_slice(&compact[20..32]);
 }
 
+#[cfg(not(Py_GIL_DISABLED))]
 unsafe fn py_ascii_from_bytes(bytes: &[u8]) -> *mut PyObject {
     unsafe {
         let unicode = PyUnicode_New(bytes.len() as Py_ssize_t, 127);
@@ -590,6 +689,11 @@ unsafe fn py_ascii_from_bytes(bytes: &[u8]) -> *mut PyObject {
         ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
         unicode
     }
+}
+
+#[cfg(Py_GIL_DISABLED)]
+unsafe fn py_ascii_from_bytes(bytes: &[u8]) -> *mut PyObject {
+    unsafe { PyUnicode_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t) }
 }
 
 unsafe fn uuid_hex_object(value: u128) -> *mut PyObject {
@@ -637,6 +741,7 @@ unsafe fn uuid_bytes_object(value: u128) -> *mut PyObject {
     unsafe { PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t) }
 }
 
+#[cfg(not(Py_GIL_DISABLED))]
 unsafe fn uuid_bytes_le_object(value: u128) -> *mut PyObject {
     unsafe {
         let object = PyBytes_FromStringAndSize(ptr::null(), 16);
@@ -656,6 +761,16 @@ unsafe fn uuid_bytes_le_object(value: u128) -> *mut PyObject {
 
         object
     }
+}
+
+#[cfg(Py_GIL_DISABLED)]
+unsafe fn uuid_bytes_le_object(value: u128) -> *mut PyObject {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&((value >> 96) as u32).to_le_bytes());
+    bytes[4..6].copy_from_slice(&((value >> 80) as u16).to_le_bytes());
+    bytes[6..8].copy_from_slice(&((value >> 64) as u16).to_le_bytes());
+    bytes[8..16].copy_from_slice(&(value as u64).to_be_bytes());
+    unsafe { PyBytes_FromStringAndSize(bytes.as_ptr().cast(), bytes.len() as Py_ssize_t) }
 }
 
 unsafe fn small_unsigned_long(value: u128) -> *mut PyObject {
@@ -2842,6 +2957,7 @@ unsafe extern "C" fn py_uuid8(
 
 unsafe extern "C" fn py_install(_self: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
+        clear_random_getrandbits();
         if !PATCHED.load(Ordering::SeqCst) {
             if register_reseed_at_fork() < 0 {
                 return ptr::null_mut();
@@ -3025,6 +3141,18 @@ unsafe fn init_methods() {
     }
 }
 
+#[cfg(Py_GIL_DISABLED)]
+static mut MODULE_SLOTS: [PyModuleDef_Slot; 2] = [
+    PyModuleDef_Slot {
+        slot: Py_mod_gil,
+        value: Py_MOD_GIL_NOT_USED as *mut c_void,
+    },
+    PyModuleDef_Slot {
+        slot: 0,
+        value: ptr::null_mut(),
+    },
+];
+
 static mut MODULE_DEF: PyModuleDef = PyModuleDef {
     m_base: PyModuleDef_HEAD_INIT,
     m_name: c"uuideal".as_ptr(),
@@ -3042,6 +3170,10 @@ pub unsafe extern "C" fn PyInit_uuideal() -> *mut PyObject {
     unsafe {
         init_methods();
         MODULE_DEF.m_methods = ptr::addr_of_mut!(METHODS).cast::<PyMethodDef>();
+        #[cfg(Py_GIL_DISABLED)]
+        {
+            MODULE_DEF.m_slots = ptr::addr_of_mut!(MODULE_SLOTS).cast::<PyModuleDef_Slot>();
+        }
         PyModuleDef_Init(ptr::addr_of_mut!(MODULE_DEF))
     }
 }
