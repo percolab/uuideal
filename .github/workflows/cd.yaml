@@ -1,0 +1,198 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSIONS: "3.12 3.13 3.14 3.14t"
+
+jobs:
+  build_and_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          # Linux glibc
+          - { os: ubuntu-latest,    rust_target: x86_64-unknown-linux-gnu,       wheel_arch: "manylinux*_x86_64",  platform_label: "Linux",     arch_label: "x86_64",        manylinux: auto }
+          - { os: ubuntu-24.04-arm, rust_target: aarch64-unknown-linux-gnu,      wheel_arch: "manylinux*_aarch64", platform_label: "Linux",     arch_label: "ARM64",         manylinux: auto }
+          - { os: ubuntu-latest,    rust_target: i686-unknown-linux-gnu,         wheel_arch: "manylinux*_i686",    platform_label: "Linux",     arch_label: "i686",          manylinux: auto, cross: true }
+          - { os: ubuntu-latest,    rust_target: armv7-unknown-linux-gnueabihf,  wheel_arch: "manylinux*_armv7l",  platform_label: "Linux",     arch_label: "armv7",         manylinux: auto, cross: true }
+          - { os: ubuntu-latest,    rust_target: ppc64le-unknown-linux-gnu,      wheel_arch: "manylinux*_ppc64le", platform_label: "Linux",     arch_label: "ppc64le",       manylinux: auto, cross: true }
+          # Linux musl
+          - { os: ubuntu-latest,    rust_target: x86_64-unknown-linux-musl,      wheel_arch: "musllinux*_x86_64",  platform_label: "Musllinux", arch_label: "x86_64",        manylinux: musllinux_1_2 }
+          - { os: ubuntu-latest,    rust_target: i686-unknown-linux-musl,        wheel_arch: "musllinux*_i686",    platform_label: "Musllinux", arch_label: "i686",          manylinux: musllinux_1_2 }
+          - { os: ubuntu-latest,    rust_target: aarch64-unknown-linux-musl,     wheel_arch: "musllinux*_aarch64", platform_label: "Musllinux", arch_label: "aarch64",       manylinux: musllinux_1_2, cross: true }
+          - { os: ubuntu-latest,    rust_target: armv7-unknown-linux-musleabihf, wheel_arch: "musllinux*_armv7l",  platform_label: "Musllinux", arch_label: "armv7",         manylinux: musllinux_1_2, cross: true }
+          # Windows
+          - { os: windows-latest,   rust_target: x86_64-pc-windows-msvc,         wheel_arch: "win_amd64",          platform_label: "Windows",   arch_label: "x64" }
+          - { os: windows-latest,   rust_target: i686-pc-windows-msvc,           wheel_arch: "win32",              platform_label: "Windows",   arch_label: "x86" }
+          - { os: windows-11-arm,   rust_target: aarch64-pc-windows-msvc,        wheel_arch: "win_arm64",          platform_label: "Windows",   arch_label: "ARM64" }
+          # macOS
+          - { os: macos-15,         rust_target: aarch64-apple-darwin,            wheel_arch: "macosx*_arm64",      platform_label: "macOS",     arch_label: "Apple Silicon" }
+          - { os: macos-15-intel,   rust_target: x86_64-apple-darwin,             wheel_arch: "macosx*_x86_64",     platform_label: "macOS",     arch_label: "Intel" }
+
+    runs-on: ${{ matrix.build.os }}
+    name: "${{ matrix.build.platform_label }} - ${{ matrix.build.arch_label }}"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Resolve Python interpreters
+        id: python
+        shell: bash
+        run: |
+          interpreters=()
+          for version in $PYTHON_VERSIONS; do
+            if [[ "${{ runner.os }}" == "Linux" ]]; then
+              interpreters+=("$version")
+            elif [[ "${{ matrix.build.os }}" == "windows-11-arm" && "$version" == "3.12" ]]; then
+              uv python install "$version"
+              interpreters+=("python$version")
+            else
+              uv python install "$version"
+              interpreters+=("$(uv python find "$version")")
+            fi
+          done
+          echo "interpreters=${interpreters[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.build.rust_target }}
+          manylinux: ${{ matrix.build.manylinux || 'auto' }}
+          args: --release --out dist -i ${{ steps.python.outputs.interpreters }}
+          sccache: "true"
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "Wheels-${{ matrix.build.platform_label }}-${{ matrix.build.arch_label }}"
+          path: dist/*.whl
+
+      - name: Find test wheel
+        id: wheel
+        if: ${{ !matrix.build.cross }}
+        shell: bash
+        run: |
+          wheel=$(find dist -name "*-cp314-*-${{ matrix.build.wheel_arch }}.whl" -type f | head -n1)
+          if [[ -z "$wheel" ]]; then
+            echo "No compatible wheel found for testing"
+            exit 1
+          fi
+          echo "path=$wheel" >> "$GITHUB_OUTPUT"
+
+      - name: Setup test environment
+        if: ${{ !matrix.build.cross }}
+        run: |
+          uv venv --python 3.14 --clear
+          uv pip install "${{ steps.wheel.outputs.path }}"
+          uv pip install pytest "hypothesis>=6.152.9"
+
+      - name: Run tests
+        if: ${{ !matrix.build.cross }}
+        run: uv run --no-project pytest tests/ -v
+
+  emscripten:
+    name: Emscripten
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.13
+      - run: uv tool install pyodide-build
+      - name: Get Emscripten version info
+        shell: bash
+        run: |
+          echo EMSCRIPTEN_VERSION=$(pyodide config get emscripten_version) >> $GITHUB_ENV
+          echo PYTHON_VERSION=$(pyodide config get python_version | cut -d '.' -f 1-2) >> $GITHUB_ENV
+      - uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+          actions-cache-folder: emsdk-cache
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+          targets: wasm32-unknown-emscripten
+      - uses: Swatinem/rust-cache@v2
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: wasm32-unknown-emscripten
+          args: --release --out dist -i ${{ env.PYTHON_VERSION }}
+          rust-toolchain: nightly
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-emscripten
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build_and_test, emscripten, sdist]
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/uuideal
+    steps:
+      - name: Prepare directories
+        run: |
+          rm -rf artifacts dist
+          mkdir -p artifacts dist
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten into dist/
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          for f in artifacts/**/*.whl artifacts/**/*.tar.gz; do
+            cp -v "$f" dist/
+          done
+          echo "Contents of dist:"
+          ls -l dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
