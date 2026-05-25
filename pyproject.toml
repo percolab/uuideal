@@ -36,6 +36,7 @@ dev = [
     "maturin>=1.0,<2.0",
     "ipython>=9.13.0",
 ]
+benchmark = ["fastuuid>=0.14,<0.15", "tqdm>=4.67,<5", "uuid-utils>=0.16,<0.17"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
