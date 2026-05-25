@@ -34,6 +34,7 @@ test = [
 dev = [
     "uuideal[test]",
     "maturin>=1.0,<2.0",
+    "ipython>=9.13.0",
 ]
 
 [tool.pytest.ini_options]
