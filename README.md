@@ -20,10 +20,10 @@ uuideal
 
 <div align="center">
   <picture>
-    <source srcset="assets/chart_dark.svg" media="(prefers-color-scheme: dark)">
-    <source srcset="assets/chart_light.svg" media="(prefers-color-scheme: light)">
+    <source srcset="https://raw.githubusercontent.com/percolab/uuideal/refs/tags/v0.1.0/assets/chart_dark.svg" media="(prefers-color-scheme: dark)">
+    <source srcset="https://raw.githubusercontent.com/percolab/uuideal/refs/tags/v0.1.0/assets/chart_light.svg" media="(prefers-color-scheme: light)">
     <img
-      src="assets/chart_light.svg"
+      src="https://raw.githubusercontent.com/percolab/uuideal/refs/tags/v0.1.0/assets/chart_light.svg"
       height="300"
       alt="Terminal window with `uv run --with uuideal ipython`, running timeit: uuid.uuid4() 1.46 μs; after uuideal.install(): 64.7 ns. Example timing from one local run; full benchmark results below."
     >
@@ -37,8 +37,11 @@ uuideal
 In [1]: import uuid
 In [2]: %timeit uuid.uuid4()
 1.46 μs ± 5.26 ns per loop (mean ± std. dev. of 7 runs, 1,000,000 loops each)
-In [3]: import uuideal; uuideal.install()
-In [4]: %timeit uuid.uuid4()
+In [3]: import uuideal
+In [4]: %timeit uuideal.uuid4()
+64.7 ns ± 0.393 ns per loop (mean ± std. dev. of 7 runs, 10,000,000 loops each)
+In [5]: uuideal.install()
+In [6]: %timeit uuid.uuid4()
 64.7 ns ± 0.108 ns per loop (mean ± std. dev. of 7 runs, 10,000,000 loops each)
 ```
 -->
@@ -106,17 +109,17 @@ and `uuid7()` and at least 3x faster for `UUID('<hex>')`._
 
 ### Generation
 
-| Operation | stdlib | `uuid_utils.compat` | _`uuid_utils`_ | stdlib + `uuideal` |
+| Operation | stdlib | `uuid_utils.compat` | _`uuid_utils`_ | stdlib&nbsp;+&nbsp;`uuideal` |
 |---|---:|---:|---:|---:|
-| `uuid1()` | 1,267 ns | 319.0 ns (3.97×) | 74.6 ns (16.97×) | **74.1 ns (17.09×)** |
-| `uuid1()`<br>`safe` | 742.7 ns | N/A | N/A | **129.3 ns (5.74×)** |
-| `uuid3()` | 984.3 ns | 665.0 ns (1.48×) | 202.3 ns (4.86×) | **175.0 ns (5.62×)** |
-| `uuid4()` | 1,182 ns | 246.0 ns (4.80×) | **58.7 ns (20.13×)** | 60.9 ns (19.39×) |
-| `uuid5()` | 977.3 ns | 646.9 ns (1.51×) | 189.8 ns (5.15×) | **164.3 ns (5.95×)** |
-| `uuid6()` | 847.6 ns | 318.8 ns (2.66×) | **71.8 ns (11.80×)** | 72.4 ns (11.71×) |
-| `uuid7()` | 1,445 ns | 294.5 ns (4.91×) | 96.4 ns (14.99×) | **84.5 ns (17.10×)** |
-| `uuid8()` | 704.1 ns | N/A | N/A | **164.8 ns (4.27×)** |
-| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.87× | 10.72× | **11.42×** |
+| `uuid1()` | 1,752 ns | 443.4 ns (3.95×) | **72.5 ns (24.18×)** | 74.1 ns (23.64×) |
+| `uuid1()`<br>`safe` | 737.7 ns | N/A | N/A | **131.4 ns (5.62×)** |
+| `uuid3()` | 1,007 ns | 669.7 ns (1.50×) | 204.6 ns (4.92×) | **176.9 ns (5.69×)** |
+| `uuid4()` | 1,195 ns | 259.0 ns (4.62×) | **60.5 ns (19.76×)** | 62.4 ns (19.17×) |
+| `uuid5()` | 993.7 ns | 653.7 ns (1.52×) | 192.5 ns (5.16×) | **167.3 ns (5.94×)** |
+| `uuid6()` | 868.5 ns | 324.8 ns (2.67×) | **71.4 ns (12.17×)** | 73.3 ns (11.84×) |
+| `uuid7()` | 1,445 ns | 300.9 ns (4.80×) | 94.8 ns (15.25×) | **86.6 ns (16.70×)** |
+| `uuid8()` | 720.1 ns | N/A | N/A | **166.1 ns (4.33×)** |
+| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.85× | 11.45× | **12.03×** |
 
 <!-- uuideal-benchmarks:generation:end -->
 
@@ -124,13 +127,13 @@ and `uuid7()` and at least 3x faster for `UUID('<hex>')`._
 
 ### Conversions
 
-| Operation | stdlib | _`uuid_utils`_ | stdlib + `uuideal` |
+| Operation | stdlib | _`uuid_utils`_ | stdlib&nbsp;+&nbsp;`uuideal` |
 |---|---:|---:|---:|
-| `UUID('<hex>')` | 484.8 ns | **97.6 ns (4.97×)** | 99.4 ns (4.88×) |
-| `str(value)` | 351.0 ns | 98.9 ns (3.55×) | **59.8 ns (5.87×)** |
-| `pickle.dumps(value)` | 1,127 ns | 1,163 ns (0.97×) | **1,077 ns (1.05×)** |
-| `pickle.loads(payload)` | 810.2 ns | **591.9 ns (1.37×)** | 674.4 ns (1.20×) |
-| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.20× | **2.45×** |
+| `UUID('<hex>')` | 492.8 ns | **99.4 ns (4.96×)** | 101.2 ns (4.87×) |
+| `str(value)` | 351.4 ns | 93.0 ns (3.78×) | **58.7 ns (5.99×)** |
+| `pickle.dumps(value)` | 1,134 ns | 1,189 ns (0.95×) | **1,083 ns (1.05×)** |
+| `pickle.loads(payload)` | 829.7 ns | **653.9 ns (1.27×)** | 700.3 ns (1.18×) |
+| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.18× | **2.45×** |
 
 <!-- uuideal-benchmarks:conversions:end -->
 
@@ -138,34 +141,35 @@ and `uuid7()` and at least 3x faster for `UUID('<hex>')`._
 
 ### Access
 
-| Operation | stdlib | _`uuid_utils`_ | stdlib + `uuideal` |
+| Operation | stdlib | _`uuid_utils`_ | stdlib&nbsp;+&nbsp;`uuideal` |
 |---|---:|---:|---:|
-| `value.int` | 41.5 ns | 64.9 ns (0.64×) | **41.4 ns (1.00×)** |
-| `value.bytes` | 91.6 ns | 57.4 ns (1.60×) | **54.0 ns (1.70×)** |
-| `value.bytes_le` | 331.4 ns | 55.3 ns (6.00×) | **53.9 ns (6.15×)** |
-| `value.hex` | 130.2 ns | 98.2 ns (1.33×) | **63.9 ns (2.04×)** |
-| `value.fields` | 335.8 ns | 103.5 ns (3.24×) | **99.9 ns (3.36×)** |
-| `value.time_low` | 79.1 ns | 51.2 ns (1.54×) | **49.7 ns (1.59×)** |
-| `value.time_mid` | 95.6 ns | 51.2 ns (1.87×) | **49.8 ns (1.92×)** |
-| `value.time_hi_version` | 95.6 ns | 51.2 ns (1.87×) | **49.6 ns (1.93×)** |
-| `value.clock_seq_hi_variant` | 95.7 ns | 46.9 ns (2.04×) | **45.5 ns (2.10×)** |
-| `value.clock_seq_low` | 95.3 ns | 46.7 ns (2.04×) | **45.6 ns (2.09×)** |
-| `value.node` | 81.5 ns | 55.4 ns (1.47×) | **54.5 ns (1.49×)** |
-| `value.time` | 535.5 ns | 57.7 ns (9.27×) | **54.3 ns (9.87×)** |
-| `value.clock_seq` | 180.8 ns | 51.2 ns (3.53×) | **49.7 ns (3.64×)** |
-| `value.urn` | 409.9 ns | 103.0 ns (3.98×) | **66.2 ns (6.19×)** |
-| `value.variant` | 114.8 ns | 63.5 ns (1.81×) | **44.9 ns (2.55×)** |
-| `value.version` | 175.3 ns | 47.0 ns (3.73×) | **44.9 ns (3.91×)** |
-| `value.is_safe` | 41.6 ns | 100.0 ns (0.42×) | **41.5 ns (1.00×)** |
-| `sorted(values)` | 491,792 ns | 261,831 ns (1.88×) | **150,660 ns (3.26×)** |
-| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.09× | **2.55×** |
+| `value.int` | **40.3 ns** | 61.3 ns (0.66×) | 40.7 ns (0.99×) |
+| `value.bytes` | 89.7 ns | 53.8 ns (1.67×) | **52.6 ns (1.71×)** |
+| `value.bytes_le` | 324.5 ns | 55.2 ns (5.88×) | **52.6 ns (6.17×)** |
+| `value.hex` | 132.2 ns | 95.2 ns (1.39×) | **62.0 ns (2.13×)** |
+| `value.fields` | 334.4 ns | 101.8 ns (3.29×) | **98.3 ns (3.40×)** |
+| `value.time_low` | 78.3 ns | 50.0 ns (1.57×) | **48.4 ns (1.62×)** |
+| `value.time_mid` | 96.0 ns | 50.2 ns (1.91×) | **48.5 ns (1.98×)** |
+| `value.time_hi_version` | 95.8 ns | 50.8 ns (1.88×) | **48.6 ns (1.97×)** |
+| `value.clock_seq_hi_variant` | 96.1 ns | 46.2 ns (2.08×) | **44.5 ns (2.16×)** |
+| `value.clock_seq_low` | 96.4 ns | 45.6 ns (2.11×) | **44.3 ns (2.18×)** |
+| `value.node` | 78.9 ns | 54.3 ns (1.45×) | **53.2 ns (1.48×)** |
+| `value.time` | 550.0 ns | 54.1 ns (10.16×) | **53.2 ns (10.34×)** |
+| `value.clock_seq` | 181.5 ns | 50.1 ns (3.62×) | **48.8 ns (3.72×)** |
+| `value.urn` | 413.0 ns | 101.4 ns (4.08×) | **64.2 ns (6.43×)** |
+| `value.variant` | 115.1 ns | 59.9 ns (1.92×) | **43.6 ns (2.64×)** |
+| `value.version` | 175.3 ns | 46.1 ns (3.80×) | **43.7 ns (4.01×)** |
+| `value.is_safe` | **40.2 ns** | 94.3 ns (0.43×) | 40.3 ns (1.00×) |
+| `sorted(values)` | 494,154 ns | 260,985 ns (1.89×) | **146,656 ns (3.37×)** |
+| **Speedup (geomean)**<sup>[\*](#uuideal-benchmarks-geomean)</sup> | 1.00× | 2.15× | **2.60×** |
 
 <!-- uuideal-benchmarks:access:end -->
 
 
-Ran on `Apple M1` `macOS 15.0.1` `CPython 3.14.3` best of `5` repeats after autoranging each case to at least `100ms` using 2 worker process(es), nice adjusted by `-20`, thread QoS set to `USER_INTERACTIVE`.
 
 _<span id="uuideal-benchmarks-geomean">*</span> Geomean uses only operation groups where every displayed candidate has valid timing data._
+
+Ran on `Apple M1` `macOS 15.0.1` `CPython 3.14.5` best of `5` repeats after autoranging each case to at least `100ms` using 2 worker process(es), nice adjusted by `-20`, thread QoS set to `USER_INTERACTIVE`.
 
 <!-- uuideal-benchmarks:end -->
 [//]: # (@formatter:on)
