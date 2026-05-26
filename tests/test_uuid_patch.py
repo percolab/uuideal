@@ -667,6 +667,30 @@ def test_uuid_pattern_matching_behavior_matches_stdlib() -> None:
     actual = classify(uuid.UUID(int=1))
     assert actual == expected
 
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda: uuid.UUID.__str__(1), id="uuid.UUID.__str__(1)"),
+        pytest.param(lambda: uuid.UUID.__repr__(1), id="uuid.UUID.__repr__(1)"),
+        pytest.param(lambda: uuid.UUID.__int__(1), id="uuid.UUID.__int__(1)"),
+        pytest.param(lambda: uuid.UUID.__hash__(1), id="uuid.UUID.__hash__(1)"),
+        pytest.param(lambda: uuid.UUID.hex.fget(1), id="uuid.UUID.hex.fget(1)"),
+        pytest.param(lambda: uuid.UUID.bytes.fget(1), id="uuid.UUID.bytes.fget(1)"),
+        pytest.param(lambda: uuid.UUID.version.fget(1), id="uuid.UUID.version.fget(1)"),
+    ],
+)
+def test_direct_uuid_descriptor_calls_with_non_uuid_receiver_match_stdlib(
+    call: Callable[[], object],
+) -> None:
+    expected = record_outcome(call)
+
+    uuideal.install()
+
+    actual = record_outcome(call)
+    assert_same_outcome(actual, expected)
+
+
 @pytest.mark.performance
 def test_concurrent_install_uninstall_while_reading_existing_objects() -> None:
     values = [uuid.UUID(int=index) for index in range(1000)]

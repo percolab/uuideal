@@ -1826,10 +1826,24 @@ unsafe fn unary_self(
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 1 || keyword_count(kwnames) != 0 {
             call_original(callable, args, nargsf, kwnames);
-            None
-        } else {
-            Some(*args)
+            return None;
         }
+
+        let self_object = *args;
+        if (*self_object).ob_type == UUID_TYPE.cast::<PyTypeObject>() {
+            return Some(self_object);
+        }
+
+        let instance_check = PyObject_IsInstance(self_object, UUID_TYPE);
+        if instance_check < 0 {
+            return None;
+        }
+        if instance_check == 0 {
+            call_original(callable, args, nargsf, kwnames);
+            return None;
+        }
+
+        Some(self_object)
     }
 }
 
