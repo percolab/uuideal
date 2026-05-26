@@ -90,7 +90,7 @@ jobs:
         if: ${{ !matrix.build.cross }}
         shell: bash
         run: |
-          wheel=$(find dist -name "*-cp314-*-${{ matrix.build.wheel_arch }}.whl" -type f | head -n1)
+          wheel=$(find dist -name "*-cp314-cp314-${{ matrix.build.wheel_arch }}.whl" -type f | head -n1)
           if [[ -z "$wheel" ]]; then
             echo "No compatible wheel found for testing"
             exit 1
