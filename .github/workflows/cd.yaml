@@ -116,7 +116,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.13
-      - run: uv tool install pyodide-build
+      - run: uv tool install pyodide-cli
       - name: Get Emscripten version info
         shell: bash
         run: |
