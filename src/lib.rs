@@ -475,6 +475,10 @@ unsafe fn u128_to_pylong(value: u128) -> *mut PyObject {
 #[cfg(not(Py_GIL_DISABLED))]
 unsafe fn pylong_to_u128(object: *mut PyObject) -> Option<u128> {
     unsafe {
+        if PyLong_Check(object) == 0 {
+            return None;
+        }
+
         let long = object.cast::<PyLongInternals>();
 
         let ndigits = {
