@@ -5,6 +5,7 @@ import operator
 import pickle
 import sys
 import uuid
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -28,29 +29,54 @@ FUZZ_SETTINGS = settings(
 )
 
 
+WarningSnapshot = tuple[type[Warning], str]
+
+
 @dataclass(frozen=True)
 class RecordedOutcome:
     kind: str
     value: Any = None
     error_type: type[BaseException] | None = None
     error_message: str | None = None
+    warnings: tuple[WarningSnapshot, ...] = ()
 
     def describe(self) -> str:
+        warning_text = (
+            ""
+            if not self.warnings
+            else f", warnings={[(category.__name__, message) for category, message in self.warnings]!r}"
+        )
         if self.kind == "error":
             error_name = self.error_type.__name__ if self.error_type is not None else None
-            return f"error(type={error_name!r}, message={self.error_message!r})"
-        return f"value({self.value!r})"
+            return f"error(type={error_name!r}, message={self.error_message!r}{warning_text})"
+        return f"value({self.value!r}{warning_text})"
 
 
 def record_outcome(call: Callable[[], Any], meta: Any = None) -> RecordedOutcome:
-    try:
-        return RecordedOutcome("value", call())
-    except BaseException as error:
-        return RecordedOutcome("error", error_type=type(error), error_message=str(error))
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        try:
+            value = call()
+        except BaseException as error:
+            warning_snapshots = tuple(
+                (warning.category, str(warning.message)) for warning in caught_warnings
+            )
+            return RecordedOutcome(
+                "error",
+                error_type=type(error),
+                error_message=str(error),
+                warnings=warning_snapshots,
+            )
+
+    warning_snapshots = tuple((warning.category, str(warning.message)) for warning in caught_warnings)
+    return RecordedOutcome("value", value, warnings=warning_snapshots)
 
 
 def assert_same_outcome(actual: RecordedOutcome, expected: RecordedOutcome, context: str = "") -> None:
     assert actual.kind == expected.kind, (
+        f"{context}\nexpected: {expected.describe()}\nactual:   {actual.describe()}"
+    )
+    assert actual.warnings == expected.warnings, (
         f"{context}\nexpected: {expected.describe()}\nactual:   {actual.describe()}"
     )
     if expected.kind == "error":

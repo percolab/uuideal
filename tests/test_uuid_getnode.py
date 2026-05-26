@@ -336,29 +336,18 @@ def test_deleting_node_invalidates_cache_and_unknown_getnode_still_works(
 
 
 @pytest.mark.parametrize("factory_name", ["uuid1", "uuid6"])
-def test_invalid_default_node_result_matches_unpatched_behavior(
-    uuid_implementation: UUIDImplementation,
-    factory_name: str,
-) -> None:
-    factory = get_factory(uuid_implementation, factory_name)
-
+def test_invalid_default_node_result_matches_unpatched_behavior(factory_name: str) -> None:
     def invalid_getnode() -> int:
         return 1 << 48
 
-    if uuid_implementation.installed:
-        uuideal.uninstall()
-        stdlib_factory = get_factory(UUIDImplementation("uuid", uuid, installed=False), factory_name)
-        uuid.getnode = invalid_getnode
-        expected = record_uuid1_outcome(stdlib_factory)
+    uuideal.uninstall()
+    stdlib_factory = get_factory(UUIDImplementation("uuid", uuid, installed=False), factory_name)
+    uuid.getnode = invalid_getnode
+    expected = record_uuid1_outcome(stdlib_factory)
 
-        uuideal.install()
-        factory = get_factory(uuid_implementation, factory_name)
-        uuid.getnode = invalid_getnode
-        actual = record_uuid1_outcome(factory)
-    else:
-        uuid.getnode = invalid_getnode
-        expected = record_uuid1_outcome(factory)
-        uuid.getnode = invalid_getnode
-        actual = record_uuid1_outcome(factory)
+    uuideal.install()
+    patched_factory = get_factory(UUIDImplementation("uuideal", uuideal, installed=True), factory_name)
+    uuid.getnode = invalid_getnode
+    actual = record_uuid1_outcome(patched_factory)
 
     assert_same_getnode_outcome(actual, expected)

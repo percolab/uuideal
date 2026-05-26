@@ -31,6 +31,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "cpython_uuid: CPython Lib/test/test_uuid.py compatibility cases",
     )
+    config.addinivalue_line(
+        "markers",
+        "performance: timing-sensitive smoke tests that should run only in stable environments",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -40,13 +44,43 @@ def clean_patch_state():
     uuideal.uninstall()
 
 
-def pytest_collection_modifyitems(items: list[Any]) -> None:
-    def sort_key(item: Any) -> tuple[int, str]:
-        path = Path(str(item.fspath))
-        is_cpython_test = path.name == "test_cpython_uuid.py"
-        is_fuzz_test = path.name == "test_uuid_fuzz.py"
-        return (2 if is_fuzz_test else 1 if is_cpython_test else 0, item.nodeid)
+ORDERED_TEST_FILES = [
+    "test_cpython_uuid.py",
+    ...,
+    "test_uuid_fork.py",
+    "test_uuid_multiprocessing.py",
+    "test_uuid_fuzz.py",
+]
 
+ORDERED_MARKERS = [
+    ...,
+    "performance",
+]
+
+
+def position(value: str | ..., ordered_values: list[str | ...]) -> int:
+    try:
+        return ordered_values.index(value)
+
+    except ValueError:
+        return ordered_values.index(...)
+
+
+def sort_key(item: Any) -> tuple[int, int, str]:
+    path = Path(str(item.fspath))
+
+    marker = "performance" if item.get_closest_marker("performance") is not None else None
+
+    test_file = path.name if path.name in ORDERED_TEST_FILES else None
+
+    return (
+        position(marker, ORDERED_MARKERS),
+        position(test_file, ORDERED_TEST_FILES),
+        item.nodeid,
+    )
+
+
+def pytest_collection_modifyitems(items: list[Any]) -> None:
     items.sort(key=sort_key)
 
     cpython_uuid_prefix = "tests/test_cpython_uuid.py::test_cpython_uuid["
