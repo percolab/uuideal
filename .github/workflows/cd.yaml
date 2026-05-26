@@ -35,7 +35,6 @@ jobs:
           - { os: ubuntu-latest,    rust_target: armv7-unknown-linux-musleabihf, wheel_arch: "musllinux*_armv7l",  platform_label: "Musllinux", arch_label: "armv7",         manylinux: musllinux_1_2, cross: true }
           # Windows
           - { os: windows-latest,   rust_target: x86_64-pc-windows-msvc,         wheel_arch: "win_amd64",          platform_label: "Windows",   arch_label: "x64" }
-          - { os: windows-latest,   rust_target: i686-pc-windows-msvc,           wheel_arch: "win32",              platform_label: "Windows",   arch_label: "x86" }
           - { os: windows-11-arm,   rust_target: aarch64-pc-windows-msvc,        wheel_arch: "win_arm64",          platform_label: "Windows",   arch_label: "ARM64" }
           # macOS
           - { os: macos-15,         rust_target: aarch64-apple-darwin,            wheel_arch: "macosx*_arm64",      platform_label: "macOS",     arch_label: "Apple Silicon" }
