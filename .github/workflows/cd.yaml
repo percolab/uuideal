@@ -29,13 +29,13 @@ jobs:
           - { os: ubuntu-latest,    rust_target: armv7-unknown-linux-gnueabihf,  wheel_arch: "manylinux*_armv7l",  platform_label: "Linux",     arch_label: "armv7",         manylinux: auto, cross: true }
           - { os: ubuntu-latest,    rust_target: ppc64le-unknown-linux-gnu,      wheel_arch: "manylinux*_ppc64le", platform_label: "Linux",     arch_label: "ppc64le",       manylinux: auto, cross: true }
           # Linux musl
-          - { os: ubuntu-latest,    rust_target: x86_64-unknown-linux-musl,      wheel_arch: "musllinux*_x86_64",  platform_label: "Musllinux", arch_label: "x86_64",        manylinux: musllinux_1_2 }
-          - { os: ubuntu-latest,    rust_target: i686-unknown-linux-musl,        wheel_arch: "musllinux*_i686",    platform_label: "Musllinux", arch_label: "i686",          manylinux: musllinux_1_2 }
+          # - { os: ubuntu-latest,    rust_target: x86_64-unknown-linux-musl,      wheel_arch: "musllinux*_x86_64",  platform_label: "Musllinux", arch_label: "x86_64",        manylinux: musllinux_1_2 }
+          # - { os: ubuntu-latest,    rust_target: i686-unknown-linux-musl,        wheel_arch: "musllinux*_i686",    platform_label: "Musllinux", arch_label: "i686",          manylinux: musllinux_1_2 }
           - { os: ubuntu-latest,    rust_target: aarch64-unknown-linux-musl,     wheel_arch: "musllinux*_aarch64", platform_label: "Musllinux", arch_label: "aarch64",       manylinux: musllinux_1_2, cross: true }
           - { os: ubuntu-latest,    rust_target: armv7-unknown-linux-musleabihf, wheel_arch: "musllinux*_armv7l",  platform_label: "Musllinux", arch_label: "armv7",         manylinux: musllinux_1_2, cross: true }
           # Windows
-          - { os: windows-latest,   rust_target: x86_64-pc-windows-msvc,         wheel_arch: "win_amd64",          platform_label: "Windows",   arch_label: "x64" }
-          - { os: windows-11-arm,   rust_target: aarch64-pc-windows-msvc,        wheel_arch: "win_arm64",          platform_label: "Windows",   arch_label: "ARM64" }
+          # - { os: windows-latest,   rust_target: x86_64-pc-windows-msvc,         wheel_arch: "win_amd64",          platform_label: "Windows",   arch_label: "x64" }
+          # - { os: windows-11-arm,   rust_target: aarch64-pc-windows-msvc,        wheel_arch: "win_arm64",          platform_label: "Windows",   arch_label: "ARM64" }
           # macOS
           - { os: macos-15,         rust_target: aarch64-apple-darwin,            wheel_arch: "macosx*_arm64",      platform_label: "macOS",     arch_label: "Apple Silicon" }
           - { os: macos-15-intel,   rust_target: x86_64-apple-darwin,             wheel_arch: "macosx*_x86_64",     platform_label: "macOS",     arch_label: "Intel" }
@@ -110,6 +110,7 @@ jobs:
 
   emscripten:
     name: Emscripten
+    if: false
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -164,7 +165,7 @@ jobs:
     name: Publish
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build_and_test, emscripten, sdist]
+    needs: [build_and_test, sdist]
     permissions:
       contents: read
       id-token: write
