@@ -1817,21 +1817,28 @@ unsafe extern "C" fn uuid_init_vectorcall(
     }
 }
 
+enum UnarySelfResult {
+    SelfObject(*mut PyObject),
+    OriginalResult(*mut PyObject),
+}
+
+#[inline(always)]
 unsafe fn unary_self(
     callable: *mut PyObject,
     args: *const *mut PyObject,
     nargsf: usize,
     kwnames: *mut PyObject,
-) -> Option<*mut PyObject> {
+) -> Option<UnarySelfResult> {
     unsafe {
         if PyVectorcall_NARGS(nargsf) != 1 || keyword_count(kwnames) != 0 {
-            call_original(callable, args, nargsf, kwnames);
-            return None;
+            return Some(UnarySelfResult::OriginalResult(call_original(
+                callable, args, nargsf, kwnames,
+            )));
         }
 
         let self_object = *args;
         if (*self_object).ob_type == UUID_TYPE.cast::<PyTypeObject>() {
-            return Some(self_object);
+            return Some(UnarySelfResult::SelfObject(self_object));
         }
 
         let instance_check = PyObject_IsInstance(self_object, UUID_TYPE);
@@ -1839,11 +1846,12 @@ unsafe fn unary_self(
             return None;
         }
         if instance_check == 0 {
-            call_original(callable, args, nargsf, kwnames);
-            return None;
+            return Some(UnarySelfResult::OriginalResult(call_original(
+                callable, args, nargsf, kwnames,
+            )));
         }
 
-        Some(self_object)
+        Some(UnarySelfResult::SelfObject(self_object))
     }
 }
 
@@ -1854,8 +1862,10 @@ unsafe extern "C" fn uuid_str_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -1871,8 +1881,10 @@ unsafe extern "C" fn uuid_hex_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -1888,8 +1900,10 @@ unsafe extern "C" fn uuid_repr_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let class = PyObject_Type(self_object);
         if class.is_null() {
@@ -1919,8 +1933,10 @@ unsafe extern "C" fn uuid_int_method_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let int_object = slot_object(self_object, INT_SLOT_OFFSET);
         if int_object.is_null() {
@@ -1938,8 +1954,10 @@ unsafe extern "C" fn uuid_hash_method_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let int_object = slot_object(self_object, INT_SLOT_OFFSET);
         if int_object.is_null() {
@@ -2132,8 +2150,10 @@ unsafe extern "C" fn uuid_bytes_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2149,8 +2169,10 @@ unsafe extern "C" fn uuid_bytes_le_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2166,8 +2188,10 @@ unsafe extern "C" fn uuid_fields_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2183,8 +2207,10 @@ unsafe extern "C" fn uuid_field_value_vectorcall<const FIELD: u8>(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2274,8 +2300,10 @@ unsafe extern "C" fn uuid_urn_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2291,8 +2319,10 @@ unsafe extern "C" fn uuid_variant_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2317,8 +2347,10 @@ unsafe extern "C" fn uuid_version_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let Some(value) = uuid_int(self_object) else {
             return call_original(callable, args, nargsf, kwnames);
@@ -2338,8 +2370,10 @@ unsafe extern "C" fn uuid_getstate_vectorcall(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        let Some(self_object) = unary_self(callable, args, nargsf, kwnames) else {
-            return ptr::null_mut();
+        let self_object = match unary_self(callable, args, nargsf, kwnames) {
+            Some(UnarySelfResult::SelfObject(self_object)) => self_object,
+            Some(UnarySelfResult::OriginalResult(result)) => return result,
+            None => return ptr::null_mut(),
         };
         let int_object = slot_object(self_object, INT_SLOT_OFFSET);
         let is_safe = slot_object(self_object, IS_SAFE_SLOT_OFFSET);
