@@ -9,6 +9,11 @@ from typing import Iterator
 
 import pytest
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT_STRING = str(PROJECT_ROOT)
+if PROJECT_ROOT_STRING not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT_STRING)
+
 import uuideal
 from tools.run_cpython_uuid_tests import (
     CpythonTestConfig,
