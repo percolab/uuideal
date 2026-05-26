@@ -17,6 +17,7 @@ static AT_FORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static DEFAULT_NODE_READY: AtomicBool = AtomicBool::new(false);
 static DEFAULT_NODE: AtomicU64 = AtomicU64::new(0);
 static GETNODE_MODE: AtomicU8 = AtomicU8::new(GETNODE_MODE_TRUSTED);
+static LAST_EXPLICIT_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 static mut UUID_MODULE: *mut PyObject = ptr::null_mut();
 static mut UUID_DICT: *mut PyObject = ptr::null_mut();
@@ -872,6 +873,26 @@ fn node_to_bytes(node: u128) -> [u8; 6] {
     ]
 }
 
+fn monotonic_explicit_timestamp(ticks: u64) -> u64 {
+    let mut previous = LAST_EXPLICIT_TIMESTAMP.load(Ordering::Relaxed);
+    loop {
+        let next = if ticks > previous {
+            ticks
+        } else {
+            previous.wrapping_add(1)
+        };
+        match LAST_EXPLICIT_TIMESTAMP.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
 unsafe fn allocate_uuid(value: u128) -> *mut PyObject {
     unsafe {
         let object = PyType_GenericAlloc(UUID_TYPE.cast::<PyTypeObject>(), 0);
@@ -1259,7 +1280,7 @@ unsafe fn generate_timestamp_uuid(
                 now.as_secs(),
                 now.subsec_nanos(),
             );
-            let ticks = ts.to_gregorian().0;
+            let ticks = monotonic_explicit_timestamp(ts.to_gregorian().0);
             if sorted {
                 uuid::Builder::from_sorted_gregorian_timestamp(ticks, clock_seq, node_bytes)
             } else {
