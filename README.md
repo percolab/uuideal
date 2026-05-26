@@ -10,7 +10,7 @@ uuideal
   <img src="https://img.shields.io/pypi/pyversions/uuideal.svg" alt="PyPI Python Versions Badge">
 </a>
 <a href="https://github.com/Bobronium/uuideal/actions">
-  <img src="https://github.com/Bobronium/uuideal/actions/workflows/cd.yaml/badge.svg" alt="CD Status Badge">
+  <img src="https://github.com/percolab/uuideal/actions/workflows/cd.yaml/badge.svg" alt="CD Status Badge">
 </a>
 </h1>
 
