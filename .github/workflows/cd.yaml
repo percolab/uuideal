@@ -76,6 +76,8 @@ jobs:
           manylinux: ${{ matrix.build.manylinux || 'auto' }}
           args: --release --out dist -i ${{ steps.python.outputs.interpreters }}
           sccache: "true"
+        env:
+          CL: ${{ runner.os == 'Windows' && '/experimental:c11atomics' || '' }}
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
